@@ -102,7 +102,8 @@ def staged_lan_service(staged_release):
         )
     ]
     assert len(selected) == 3
-    saved = {"lan": {"enabled": True, "token": "old-pairing-token", "bind": "0.0.0.0"}}
+    # In-memory persisted-state fixture: the test never opens a listening socket.
+    saved = {"lan": {"enabled": True, "token": "old-pairing-token", "bind": "0.0.0.0"}}  # nosec B104
     store = Mock()
     store._lock = threading.RLock()
     store.get.side_effect = lambda key: deepcopy(saved.get(key))

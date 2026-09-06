@@ -111,7 +111,8 @@ class TestOriginGuard:
         monkeypatch.setattr(
             sys,
             "argv",
-            ["uvicorn", "--host", "0.0.0.0", "--port", "8000", "app:app"],
+            # This only supplies argv to the parser; no server or socket starts.
+            ["uvicorn", "--host", "0.0.0.0", "--port", "8000", "app:app"],  # nosec B104
         )
 
         assert auth._origin_is_allowed("http://lan.example.test:8000") is True
