@@ -922,7 +922,7 @@ def _origin_is_allowed(origin: str | None) -> bool:
     try:
         parsed = urlsplit(normalized)
         parsed_port = parsed.port
-        expected_port = int(os.getenv("WANWEI_PORT", "8010").strip() or "8010")
+        expected_port = int(_effective_port())
     except (ValueError, TypeError):
         return False
     return (

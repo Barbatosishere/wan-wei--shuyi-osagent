@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import sys
 
 import pytest
 from fastapi.testclient import TestClient
@@ -101,6 +102,21 @@ class TestOriginGuard:
             json={"text": "团队周会每周三下午"},
         )
         assert r.status_code == 200
+
+    def test_allowed_lan_origin_uses_cli_port(self, client, monkeypatch):
+        """The Origin fallback must follow uvicorn's effective CLI port."""
+        from backend.app.security import auth
+
+        monkeypatch.delenv("WANWEI_PORT", raising=False)
+        monkeypatch.setenv("WANWEI_ALLOWED_HOSTS", "testserver,lan.example.test")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["uvicorn", "--host", "0.0.0.0", "--port", "8000", "app:app"],
+        )
+
+        assert auth._origin_is_allowed("http://lan.example.test:8000") is True
+        assert auth._origin_is_allowed("http://lan.example.test:8010") is False
 
     def test_get_with_evil_origin_not_blocked_by_origin_guard(self, client):
         # Origin 校验只针对写方法；GET 的读取面由 Host 校验与 API key 覆盖。
