@@ -37,8 +37,11 @@ def _client(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _cleanup_files(tmp_path):
+def _cleanup_files(tmp_path, monkeypatch):
     client = _client(tmp_path)
+    from backend.app.platform_api import mobile_remote
+
+    monkeypatch.setattr(mobile_remote, '_UPLOAD_DIR', tmp_path / 'uploads')
     yield client
     # 清理测试上传的文件
     try:
@@ -193,7 +196,9 @@ def test_delete_file_when_physical_delete_is_unavailable(tmp_path, monkeypatch):
     )
     assert up_resp.status_code == 200, up_resp.text
     fid = up_resp.json()['file_id']
-    upload_path = PROJECT_ROOT / 'backend' / 'app' / 'uploads' / fid
+    from backend.app.platform_api import mobile_remote
+
+    upload_path = mobile_remote._UPLOAD_DIR / fid
     original_unlink = Path.unlink
 
     def unavailable_for_uploaded_file(path, *args, **kwargs):

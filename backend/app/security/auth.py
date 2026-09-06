@@ -28,9 +28,10 @@ import os
 import secrets
 import sqlite3
 import sys
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from collections.abc import Callable
 from urllib.parse import urlsplit
 
 from fastapi import Request, status
@@ -62,9 +63,9 @@ def _api_key_hash(api_key: str) -> str:
     """API key 的不可逆哈希（用于 identity 表查询，不存储明文 key）。
 
     说明（CodeQL py/weak-sensitive-data-hashing）：SHA-256 在这里不是密码哈希，
-    而是高熵 API key（secrets.token_hex(24)，96 bit 熵）的确定性索引。
-    输入空间足够大，离线暴力破解不成立；输出仅用于 identity 表查询，
-    不用于凭据校验（校验走 compare_digest 明文常量时间比较）。
+    而是高熵 API key（secrets.token_hex(24)，192 bit 熵）的确定性索引。
+    注册凭据按此索引查询，再检查身份活跃状态或 LAN 会话有效期；
+    未注册的配置 key 则由 compare_digest 比对。这不是低熵口令的存储方案。
     """
     return hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest()
 
@@ -73,9 +74,8 @@ def _derive_legacy_owner_id(api_key: str) -> str:
     """旧版派生逻辑（blake2b），仅用于向后兼容和 identity 表未命中时的回退。
 
     说明（CodeQL py/weak-sensitive-data-hashing）：blake2b 在这里不是密码哈希，
-    而是高熵 API key（secrets.token_hex(24)，96 bit 熵）的确定性派生。
-    输入空间足够大，离线暴力破解不成立；输出仅用作稳定标识符，
-    不用于凭据校验（校验走 compare_digest 明文常量时间比较）。
+    而是高熵 API key（secrets.token_hex(24)，192 bit 熵）的确定性派生。
+    输出仅用作兼容旧数据的稳定标识符，不授予凭据认证能力。
     保留此函数是为了向后兼容：identity 表未建时，既有 agent 行的 owner_id
     仍按此逻辑派生，不因升级而变更。
     """
@@ -92,19 +92,45 @@ def _identity_table_ready() -> bool:
 
     只读查询复用线程本地连接，不创建或提交调用方事务。
     """
-    from ..db import get_conn
+    from ..db import assert_db_identity, get_conn
 
-    row = get_conn().execute(
+    conn = get_conn()
+    assert_db_identity()
+    row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='identity'"
     ).fetchone()
     return row is not None
+
+
+@contextmanager
+def _credential_transaction() -> Iterator[sqlite3.Connection]:
+    """Serialize credential changes without committing the caller's transaction."""
+    from ..db import _db_path, assert_db_identity
+
+    path = str(_db_path())
+    assert_db_identity()
+    conn = sqlite3.connect(path, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("BEGIN IMMEDIATE")
+        # These independent connections bypass db.transaction(); retain its
+        # file-identity guard, including a replacement while waiting for a lock.
+        assert_db_identity()
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def actor_id_from_api_key(api_key: str) -> str:
     """Resolve the stable owner ID for an API key.
 
     **v0.12 身份层解耦**：owner_id 不再由 API key 直接派生，而是独立 UUID。
-    首次使用时自动注册到 identity 表；后续 key 轮换通过 ``rotate_api_key``
+    配置的 owner key 首次使用时注册到 identity 表；后续 key 轮换通过 ``rotate_api_key``
     将新 key 映射到同一 identity_id，历史数据不丢失。
 
     向后兼容：identity 表未建（旧数据库）时回退到旧版 blake2b 派生，
@@ -125,9 +151,8 @@ def actor_id_from_api_key(api_key: str) -> str:
     if not _identity_table_ready():
         return _derive_legacy_owner_id(normalized)
 
-    from ..db import _db_path, get_conn
+    from ..db import get_conn
     from ..utils.datetime_utils import utc_now_iso_compact
-    import sqlite3
     import uuid
 
     key_hash = _api_key_hash(normalized)
@@ -141,33 +166,22 @@ def actor_id_from_api_key(api_key: str) -> str:
     if not secrets.compare_digest(normalized.encode('utf-8'), get_api_key().encode('utf-8')):
         return _derive_legacy_owner_id(normalized)
 
-    # Only owner bootstrap acquires a write lock; the caller's transaction is
-    # never committed or rolled back by identity resolution.
-    conn = sqlite3.connect(str(_db_path()), timeout=5)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("BEGIN IMMEDIATE")
+    # Recheck under the write lock: another request may have bootstrapped this
+    # owner after the read-only fast path found no identity.
+    with _credential_transaction() as conn:
         row = conn.execute(
             "SELECT identity_id FROM identity WHERE api_key_hash=?",
             (key_hash,),
         ).fetchone()
         if row is not None:
-            conn.commit()
             return str(row["identity_id"])
         identity_id = "id_" + uuid.uuid4().hex[:16]
         conn.execute(
             "INSERT INTO identity(identity_id, api_key_hash, created_at) VALUES (?,?,?)",
             (identity_id, key_hash, utc_now_iso_compact()),
         )
-        conn.commit()
-        logger.info("identity bootstrap: owner key registered as %s", identity_id)
-        return identity_id
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    logger.info("identity bootstrap: owner key registered as %s", identity_id)
+    return identity_id
 
 
 def rotate_api_key(old_key: str, new_key: str) -> str:
@@ -183,18 +197,12 @@ def rotate_api_key(old_key: str, new_key: str) -> str:
     if not _identity_table_ready():
         raise RuntimeError("identity table not initialized; run init_db first")
 
-    from ..db import _db_path
     from ..utils.datetime_utils import utc_now_iso_compact
-    import sqlite3
 
     old_hash = _api_key_hash(old_key)
     new_hash = _api_key_hash(new_key)
 
-    conn = sqlite3.connect(str(_db_path()), timeout=5)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.execute("BEGIN IMMEDIATE")
+    with _credential_transaction() as conn:
         row = conn.execute(
             "SELECT identity_id FROM identity "
             "WHERE api_key_hash=? AND is_active=1",
@@ -239,13 +247,7 @@ def rotate_api_key(old_key: str, new_key: str) -> str:
             "VALUES (?,?,?,?)",
             (identity_id, new_hash, utc_now_iso_compact(), identity_id),
         )
-        conn.commit()
-        return identity_id
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    return identity_id
 
 
 def revoke_api_key(
@@ -270,26 +272,25 @@ def revoke_api_key(
     if current_key and normalized == current_key.strip():
         raise ValueError("cannot revoke the key used by the current request")
 
-    from ..db import get_conn
-
     key_hash = _api_key_hash(normalized)
-    conn = get_conn()
-    row = conn.execute(
-        "SELECT identity_id, is_active FROM identity WHERE api_key_hash=?",
-        (key_hash,),
-    ).fetchone()
-    if not row:
-        return {"revoked": False, "reason": "key_not_registered"}
-    if not row["is_active"]:
-        return {"revoked": False, "reason": "key_already_inactive"}
-    if current_identity_id is not None and str(row["identity_id"]) != current_identity_id:
-        return {"revoked": False, "reason": "key_not_owned"}
+    with _credential_transaction() as conn:
+        # Filter by owner before examining status: foreign active/inactive keys
+        # must have the same response as an unknown key.
+        query = "SELECT identity_id, is_active FROM identity WHERE api_key_hash=?"
+        params = [key_hash]
+        if current_identity_id is not None:
+            query += " AND identity_id=?"
+            params.append(current_identity_id)
+        row = conn.execute(query, params).fetchone()
+        if row is None:
+            return {"revoked": False, "reason": "key_not_registered"}
+        if not row["is_active"]:
+            return {"revoked": False, "reason": "key_already_inactive"}
 
-    conn.execute(
-        "UPDATE identity SET is_active=0 WHERE api_key_hash=?",
-        (key_hash,),
-    )
-    conn.commit()
+        conn.execute(
+            "UPDATE identity SET is_active=0 WHERE api_key_hash=? AND identity_id=?",
+            (key_hash, row["identity_id"]),
+        )
     return {
         "revoked": True,
         "identity_id": str(row["identity_id"]),
@@ -300,19 +301,14 @@ def revoke_api_key(
 def _lan_session_table_ready() -> bool:
     if not _identity_table_ready():
         return False
-    from ..db import _db_path
+    from ..db import get_conn
 
-    try:
-        conn = sqlite3.connect(str(_db_path()))
-        try:
-            row = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lan_sessions'"
-            ).fetchone()
-            return row is not None
-        finally:
-            conn.close()
-    except Exception:
-        return False
+    # A missing legacy table is harmless; a database error must propagate so
+    # desktop reconciliation cannot report successful revocation after failure.
+    row = get_conn().execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lan_sessions'"
+    ).fetchone()
+    return row is not None
 
 
 def issue_lan_session(identity_id: str, *, ttl_seconds: int) -> tuple[str, str]:
@@ -322,14 +318,17 @@ def issue_lan_session(identity_id: str, *, ttl_seconds: int) -> tuple[str, str]:
     if ttl_seconds <= 0:
         raise ValueError("ttl_seconds must be positive")
 
-    from ..db import _db_path
     from ..utils.datetime_utils import utc_now_iso_compact
 
     credential = "lan_" + secrets.token_urlsafe(32)
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
-    conn = sqlite3.connect(str(_db_path()), timeout=5)
-    try:
-        conn.execute("PRAGMA busy_timeout=5000")
+    with _credential_transaction() as conn:
+        active_identity = conn.execute(
+            "SELECT 1 FROM identity WHERE identity_id=? AND is_active=1 LIMIT 1",
+            (identity_id,),
+        ).fetchone()
+        if active_identity is None:
+            raise ValueError("LAN session requires an active identity")
         conn.execute(
             "INSERT INTO lan_sessions(credential_hash, identity_id, created_at, expires_at) "
             "VALUES (?,?,?,?)",
@@ -340,9 +339,6 @@ def issue_lan_session(identity_id: str, *, ttl_seconds: int) -> tuple[str, str]:
                 expires_at.isoformat(),
             ),
         )
-        conn.commit()
-    finally:
-        conn.close()
     return credential, expires_at.isoformat()
 
 
@@ -350,23 +346,23 @@ def revoke_lan_sessions() -> int:
     """Revoke every currently active LAN session credential."""
     if not _lan_session_table_ready():
         return 0
-    from ..db import _db_path
     from ..utils.datetime_utils import utc_now_iso_compact
 
-    conn = sqlite3.connect(str(_db_path()), timeout=5)
-    try:
+    with _credential_transaction() as conn:
         cursor = conn.execute(
             "UPDATE lan_sessions SET revoked_at=? WHERE revoked_at IS NULL",
             (utc_now_iso_compact(),),
         )
-        conn.commit()
         return max(cursor.rowcount, 0)
-    finally:
-        conn.close()
 
 
 def _lan_session_identity(credential: str) -> str | None:
-    """Return the mapped identity only for an active, unexpired LAN session."""
+    """Require an unexpired session and at least one active key for its identity.
+
+    Rotation retires an individual key while preserving the identity, so an
+    active replacement key keeps the session valid; a fully inactive identity
+    must lose remote access as well.
+    """
     if not credential.startswith("lan_") or not _lan_session_table_ready():
         return None
     from ..db import _db_path
@@ -374,8 +370,10 @@ def _lan_session_identity(credential: str) -> str | None:
     conn = sqlite3.connect(str(_db_path()), timeout=5)
     try:
         row = conn.execute(
-            "SELECT identity_id, expires_at, revoked_at FROM lan_sessions "
-            "WHERE credential_hash=?",
+            "SELECT session.identity_id, session.expires_at, session.revoked_at "
+            "FROM lan_sessions AS session WHERE session.credential_hash=? "
+            "AND EXISTS (SELECT 1 FROM identity "
+            "WHERE identity.identity_id=session.identity_id AND identity.is_active=1)",
             (_api_key_hash(credential),),
         ).fetchone()
         if row is None or row[2] is not None:

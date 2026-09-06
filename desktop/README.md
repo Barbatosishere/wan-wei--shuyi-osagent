@@ -35,15 +35,17 @@ desktop/
 
 推荐在麒麟 V11 或兼容 Debian 系 Linux 上执行。
 
+源码构建要求 Node.js 22.12+、npm 10+、Git 与可用的 Linux 打包工具。安装依赖后先检查 `node --version` 和 `npm --version`；发行版仓库中的 Node 版本不足时，应先安装满足要求的版本。
+
 ```bash
 cd desktop/
 
 # 安装构建依赖（麒麟/Debian）
 sudo apt update
-sudo apt install -y nodejs npm python3-venv python3-pip rpm
+sudo apt install -y git nodejs npm python3-venv python3-pip rpm
 
 # 安装桌面端依赖
-npm install
+npm ci
 
 # 构建 deb 包
 npm run pack:deb
@@ -56,9 +58,11 @@ npm run pack:all
 产物输出在 `desktop/release/`：
 
 ```
-release/wanwei-shuyi-desktop_0.11.0_amd64.deb
-release/wanwei-shuyi-desktop-0.11.0.x86_64.rpm
+release/wanwei-shuyi-desktop_1.0.0_amd64.deb
+release/wanwei-shuyi-desktop-1.0.0.x86_64.rpm
 ```
+
+打包从当前 Git HEAD 导出 `desktop/release-stage/`，因此先提交需要交付的源码；有未提交的已跟踪文件时脚本会拒绝构建。`packaging/release-clean.patch` 只清理 staging 中的手机伴侣 API/UI、配对入口和浮动手机窗口，研发工作树保留完整功能。发布树仍保留冷启动 LAN 撤销、本地绑定核对和带 owner 校验的关闭接口。修改相关源码后须同步更新补丁并运行 `test_pr215_release_staging.py`。
 
 ### 3.2 在 Windows 上开发/交叉准备
 
@@ -66,11 +70,11 @@ Windows 可完成前端构建和脚本验证，但**无法直接生成 Linux 安
 
 ```powershell
 cd frontend/console-vue
-npm install
+npm ci
 npm run build              # 确保 Web 产物为最新
 
-cd ../desktop
-npm install                # 安装 Electron 与 electron-builder
+cd ../../desktop
+npm ci                     # 安装 Electron 与 electron-builder
 node --check src/main.js
 node --check src/preload.js
 ```
@@ -83,11 +87,11 @@ node --check src/preload.js
 wsl -d Ubuntu
 
 cd /path/to/wan-wei--shuyi-osagent/desktop
-npm install
+npm ci
 npm run pack:deb
 
 # 安装
-sudo dpkg -i release/wanwei-shuyi-desktop_0.11.0_amd64.deb
+sudo dpkg -i release/wanwei-shuyi-desktop_1.0.0_amd64.deb
 
 # 使用虚拟显示启动（无图形桌面环境也适用，并验证安装后的 setuid 沙箱）
 timeout 60 xvfb-run --auto-servernum /opt/wanwei-shuyi-desktop/wanwei-shuyi-desktop
@@ -100,7 +104,7 @@ timeout 60 xvfb-run --auto-servernum /opt/wanwei-shuyi-desktop/wanwei-shuyi-desk
 ### 4.1 安装 deb 包（麒麟/Debian/Ubuntu）
 
 ```bash
-sudo dpkg -i release/wanwei-shuyi-desktop_0.11.0_amd64.deb
+sudo dpkg -i release/wanwei-shuyi-desktop_1.0.0_amd64.deb
 # 若依赖不足
 sudo apt --fix-broken install -y
 ```
@@ -116,7 +120,7 @@ sudo apt --fix-broken install -y
 ### 4.2 安装 rpm 包（银河麒麟高级服务器版/openEuler/统信）
 
 ```bash
-sudo rpm -i release/wanwei-shuyi-desktop-0.11.0.x86_64.rpm
+sudo rpm -i release/wanwei-shuyi-desktop-1.0.0.x86_64.rpm
 ```
 
 ### 4.3 启动方式
@@ -152,6 +156,8 @@ http://127.0.0.1:<port>/console/
 
 ## 六、桌面特性
 
+下表中的手机控制和浮动手机窗口属于完整源码开发形态，Linux 发布安装包会在 staging 中移除这些入口。源码版配对使用一次性 token 和独立的 15 分钟 session credential；关闭、重新开启 LAN 或会话到期后需要重新配对，不会将桌面主 API key 下发给手机。详见[身份隔离与 LAN 说明](../docs/OWNER_ISOLATION_AND_LAN.md)。
+
 | 特性 | 实现方式 | 说明 |
 |---|---|---|
 | 窗口管理 | `BrowserWindow` | 记住尺寸/位置，关闭即最小化到托盘 |
@@ -163,7 +169,7 @@ http://127.0.0.1:<port>/console/
 | 单实例 | `app.requestSingleInstanceLock` | 重复点击仅唤醒已运行实例 |
 | 防睡眠（v0.11.0） | `powerSaveBlocker` | `app`（仅阻止系统挂起）/ `display`（连同屏幕常亮）两档，托盘可切，保证长时编排运行期间机器不睡 |
 | 局域网手机控制（v0.11.0） | 后端 `127.0.0.1 ↔ 0.0.0.0` 热重启切换 | 自动优选私有网段 IPv4 生成手机访问地址，配合 `/mobile` 页面与 LAN token 构成「手机伴侣」通道 |
-| 浮动工作区小窗（v0.11.0） | 无边框置顶 `BrowserWindow`（420×640） | 从托盘显示/隐藏；托盘勾选跟随真实可见/最小化状态并可恢复既有窗口。加载 `/console/#/mobile?floating=1`，顶部保留拖动区，按钮与输入框保持正常交互。首次使用需在手机伴侣面板完成配对；同一桌面会话会复用配对状态 |
+| 浮动工作区小窗（v0.11.0） | 无边框置顶 `BrowserWindow`（420×640） | 从托盘显示/隐藏；托盘勾选跟随真实可见/最小化状态并可恢复既有窗口。加载 `/console/#/mobile?floating=1`，顶部保留拖动区，按钮与输入框保持正常交互。首次使用需在手机伴侣面板完成配对；仅在当前短期凭证有效时复用配对状态 |
 
 ## 七、环境变量
 

@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse, urlsplit, urlunsplit, urlencode
 
 import httpx
@@ -471,11 +471,11 @@ _AUX_DEFAULT = {
 # 请求体模型
 # ---------------------------------------------------------------------------
 class ConfigIn(BaseModel):
-    api_key: Optional[str] = None
-    base_url: Optional[str] = None
-    model: Optional[str] = None
-    enabled: Optional[bool] = None
-    extra: Optional[dict[str, Any]] = None
+    api_key: str | None = None
+    base_url: str | None = None
+    model: str | None = None
+    enabled: bool | None = None
+    extra: dict[str, Any] | None = None
 
 
 class TestIn(BaseModel):
@@ -483,10 +483,10 @@ class TestIn(BaseModel):
 
 
 class AuxIn(BaseModel):
-    pid: Optional[str] = None
-    model: Optional[str] = None
-    enabled: Optional[bool] = None
-    purpose: Optional[str] = None
+    pid: str | None = None
+    model: str | None = None
+    enabled: bool | None = None
+    purpose: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +509,7 @@ def _decrypt_key(record: dict[str, Any]) -> str:
         return ''
 
 
-def _masked_config(pid: str, record: Optional[dict[str, Any]]) -> dict[str, Any]:
+def _masked_config(pid: str, record: dict[str, Any] | None) -> dict[str, Any]:
     """把存储记录转为对外脱敏视图；record 为 None 时回目录默认值。"""
     meta = _CATALOG_BY_ID[pid]
     record = record or {}
@@ -683,17 +683,19 @@ def _remove_config(pid: str, owner_id: str | None = None) -> bool:
     """Delete only this actor's scoped record or its compatible legacy row."""
     def _remove(data: dict) -> bool:
         if owner_id is not None:
+            removed = False
             records = _owner_records(data, owner_id)
             if records and pid in records:
-                removed = records.pop(pid)
-                if isinstance(removed, dict) and removed.get('_legacy_compat'):
-                    data.pop(pid, None)
-                return True
+                records.pop(pid)
+                removed = True
+            # Updating a legacy provider can leave a scoped copy beside its
+            # original row. Delete both owned copies so fallback reads cannot
+            # reactivate credentials the owner has explicitly removed.
             legacy = data.get(pid)
             if isinstance(legacy, dict) and _record_visible(legacy, owner_id):
                 data.pop(pid, None)
-                return True
-            return False
+                removed = True
+            return removed
         return data.pop(pid, None) is not None
 
     return _store.mutate(_remove)
@@ -718,7 +720,7 @@ _CHAT_UNSUPPORTED_PIDS = frozenset({
 })
 
 
-def get_active_provider(owner_id: str | None = None) -> Optional[dict[str, str]]:
+def get_active_provider(owner_id: str | None = None) -> dict[str, str] | None:
     """按指定 actor 返回第一个「已启用且可真实调用」的云端 provider 配置。
 
     「可用」的完整条件：enabled=True + 密钥已存且可解密 + base_url/model 齐备；
@@ -1154,7 +1156,7 @@ def _purge_expired_pending(pending: dict[str, Any]) -> None:
 
 
 def _save_pending_state(
-    pid: str, state: Optional[dict[str, Any]], owner_id: str | None = None,
+    pid: str, state: dict[str, Any] | None, owner_id: str | None = None,
 ) -> None:
     actor = owner_id or configured_actor_id()
     key = _pending_key(actor)

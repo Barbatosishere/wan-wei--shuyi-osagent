@@ -24,7 +24,7 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from ..audit.service import list_logs, record
-from ..db import get_conn
+from ..db import get_conn, transaction
 from ..security.auth import _lan_session_identity
 from ..security.input_limits import MOBILE_UPLOAD_MAX_FILE_BYTES
 from ..soul.ownership import actor_id_for_request, configured_actor_id
@@ -295,6 +295,31 @@ def _claim_legacy_file(conn, row, owner_id: str) -> None:
     conn.commit()
 
 
+def _register_uploaded_file(file_id: str, file: UploadFile, size_bytes: int, owner_id: str) -> None:
+    from ..utils.datetime_utils import utc_now_iso
+
+    conn = get_conn()
+    _file_meta_table(conn)
+    quota_clause = 'owner_id=?'
+    if _legacy_owner_allowed(owner_id):
+        quota_clause += " OR owner_id IS NULL OR owner_id=''"
+    with transaction(immediate=True) as conn:
+        # Serialize the quota decision with registration so simultaneous
+        # uploads cannot each spend the same remaining allowance. The shared
+        # transaction also rejects writes after the database file is replaced.
+        quota = conn.execute(
+            f'SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM mobile_files WHERE {quota_clause}',
+            (owner_id,),
+        ).fetchone()
+        if quota[0] >= MAX_FILES or quota[1] + size_bytes > MAX_TOTAL_BYTES:
+            raise HTTPException(413, 'upload quota exceeded')
+        conn.execute(
+            'INSERT INTO mobile_files(file_id,filename,size_bytes,content_type,created_at,owner_id) '
+            'VALUES (?,?,?,?,?,?)',
+            (file_id, file.filename or 'unnamed', size_bytes, file.content_type or '', utc_now_iso(), owner_id),
+        )
+
+
 @router.post('/upload')
 async def upload_file(
     request: Request,
@@ -304,7 +329,7 @@ async def upload_file(
     """上传文件到后端存储，AI 可通过 canonical content URL 读取。"""
     owner_id = actor_id_for_request(request)
     file_id = 'file_' + uuid.uuid4().hex[:12]
-    MAX_BYTES = MOBILE_UPLOAD_MAX_FILE_BYTES
+    max_bytes = MOBILE_UPLOAD_MAX_FILE_BYTES
 
     # 预检：优先用 file.size，回退 Content-Length 头；超限直接 413 不落盘
     declared = getattr(file, 'size', None) or 0
@@ -313,44 +338,31 @@ async def upload_file(
             declared = int(file.headers.get('content-length', 0))
         except (ValueError, TypeError):
             declared = 0
-    if declared > MAX_BYTES:
+    if declared > max_bytes:
         raise HTTPException(413, '文件超过 50MB 限制')
 
     dest = _ensure_upload_dir() / file_id
     total = 0
-    CHUNK = 256 * 1024  # 256KB chunks
-
-    with dest.open('wb') as fh:
-        while True:
-            chunk = await file.read(CHUNK)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > MAX_BYTES:
+    chunk_size = 256 * 1024
+    created = registered = False
+    try:
+        with dest.open('xb') as output:
+            created = True
+            while chunk := await file.read(chunk_size):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(413, '文件超过 50MB 限制')
+                output.write(chunk)
+        _register_uploaded_file(file_id, file, total, owner_id)
+        registered = True
+    finally:
+        # Cancellation also reaches this cleanup. Close the handle first for
+        # Windows, and never remove an existing file after exclusive-open fails.
+        if created and not registered:
+            try:
                 dest.unlink(missing_ok=True)
-                raise HTTPException(413, '文件超过 50MB 限制')
-            fh.write(chunk)
-
-    conn = get_conn()
-    _file_meta_table(conn)
-    quota_clause = "owner_id=?"
-    quota_params = [owner_id]
-    if _legacy_owner_allowed(owner_id):
-        quota_clause += " OR owner_id IS NULL OR owner_id=''"
-    quota = conn.execute(
-        f'SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM mobile_files WHERE {quota_clause}',
-        quota_params,
-    ).fetchone()
-    if quota[0] >= MAX_FILES or quota[1] + total > MAX_TOTAL_BYTES:
-        dest.unlink(missing_ok=True)
-        raise HTTPException(413, 'upload quota exceeded')
-    from ..utils.datetime_utils import utc_now_iso
-    conn.execute(
-        'INSERT INTO mobile_files(file_id,filename,size_bytes,content_type,created_at,owner_id) '
-        'VALUES (?,?,?,?,?,?)',
-        (file_id, file.filename or 'unnamed', total, file.content_type or '', utc_now_iso(), owner_id),
-    )
-    conn.commit()
+            except OSError:
+                logger.warning('failed to remove unregistered mobile upload %s', file_id)
 
     record(
         'file_upload',

@@ -251,3 +251,24 @@ def test_context_size_filters_history_before_counting_and_truncating(client, hea
     assert unbound.status_code == 200, unbound.text
     assert unbound.json()["history"] == 0
     assert unbound.json()["previews"]["history_runs"] == 0
+
+
+@pytest.mark.parametrize("headers,other_headers", [(HEADERS_A, HEADERS_B), (HEADERS_B, HEADERS_A)])
+def test_floating_sessions_remain_private_after_run_retention(client, headers, other_headers):
+    from backend.app.platform_api import agents as agents_mod
+
+    agent_id = _create_agent(client, headers)
+    run_id = _create_run(client, headers, agent_id)
+    session = agents_mod._register_floating(agents_mod._runs.get(run_id))
+    # Run retention and floating-session expiry have separate lifecycles.
+    agents_mod._runs.mutate(lambda runs: runs.pop(run_id))
+
+    own = client.get("/platform/agents/workspace/floating", headers=headers)
+    assert own.status_code == 200, own.text
+    assert session["id"] in {item["id"] for item in own.json()["items"]}
+
+    other = client.get("/platform/agents/workspace/floating", headers=other_headers)
+    assert other.status_code == 200, other.text
+    assert other.json()["items"] == []
+    assert other.json()["total"] == 0
+    assert agents_mod._floating_map()[session["id"]] == session

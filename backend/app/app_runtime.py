@@ -2580,8 +2580,12 @@ def memory_identity_rotate(
     当前请求的 key 从请求头取（而非环境变量），支持多 key 场景。
     """
     from .security.auth import rotate_api_key
+    import sqlite3
 
-    new_key = (body.get("new_key") or "").strip()
+    raw_key = body.get("new_key")
+    if not isinstance(raw_key, str):
+        raise HTTPException(status_code=422, detail="new_key must be a string")
+    new_key = raw_key.strip()
     if (len(new_key) < MIN_PRODUCTION_API_KEY_LENGTH or
             not re.fullmatch(r'[A-Za-z0-9_-]{32,}', new_key) or len(set(new_key)) < 3):
         raise HTTPException(
@@ -2592,7 +2596,16 @@ def memory_identity_rotate(
     old_key = (request.headers.get("x-api-key") or "").strip() if request else ""
     if not old_key:
         raise HTTPException(status_code=401, detail="Missing X-API-Key")
-    identity_id = rotate_api_key(old_key, new_key)
+    try:
+        identity_id = rotate_api_key(old_key, new_key)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="new key is unavailable") from None
+    except KeyError:
+        # The credential can be revoked between middleware authentication and
+        # the transaction acquiring its lock.
+        raise HTTPException(status_code=401, detail="current key is no longer active") from None
+    except (sqlite3.Error, RuntimeError):
+        raise HTTPException(status_code=503, detail="service unavailable") from None
     return {
         "identity_id": identity_id,
         "rotated": True,
@@ -2614,7 +2627,10 @@ def memory_identity_revoke(
     """
     from .security.auth import actor_id_from_api_key, revoke_api_key
 
-    target_key = (body.get("api_key") or "").strip()
+    raw_key = body.get("api_key")
+    if not isinstance(raw_key, str):
+        raise HTTPException(status_code=422, detail="api_key must be a string")
+    target_key = raw_key.strip()
     if not target_key:
         raise HTTPException(status_code=422, detail="api_key is required")
 

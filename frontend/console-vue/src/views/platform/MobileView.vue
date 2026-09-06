@@ -66,16 +66,31 @@ const deviceName = ref('')
 const verifying = ref(false)
 const manualToken = ref('')
 let mounted = false
-const requestController = new AbortController()
+let requestController = new AbortController()
 let localCredential = ''
 const requestOptions = (): ReqOptions => ({ signal: requestController.signal, credential: localCredential })
 const pairingRequestOptions = (): ReqOptions => ({ signal: requestController.signal, credential: '' })
-// A response may settle after abort (for example while parsing its body).
+function isActiveRequest(controller: AbortController): boolean {
+  return mounted && controller === requestController && !controller.signal.aborted
+}
+function assertActiveRequest(controller: AbortController): void {
+  if (!isActiveRequest(controller)) throw new DOMException('Mobile session ended', 'AbortError')
+}
+
+// Body parsing can settle after abort. Keep both success and error responses
+// from a former session from changing a newly paired session's state.
 async function mobileRequest<T>(send: (options: ReqOptions) => Promise<T>): Promise<T> {
-  if (!mounted) throw new DOMException('Mobile view unmounted', 'AbortError')
-  const result = await send(requestOptions())
-  if (!mounted) throw new DOMException('Mobile view unmounted', 'AbortError')
-  return result
+  const controller = requestController
+  assertActiveRequest(controller)
+  if (phase.value !== 'paired' || !localCredential) throw new DOMException('Mobile session ended', 'AbortError')
+  try {
+    const result = await send(requestOptions())
+    assertActiveRequest(controller)
+    return result
+  } catch (error) {
+    assertActiveRequest(controller)
+    throw error
+  }
 }
 function mobileGet<T>(path: string): Promise<T> { return mobileRequest(options => apiGet<T>(path, options)) }
 function mobilePost<T>(path: string, body?: unknown): Promise<T> { return mobileRequest(options => apiPost<T>(path, body, options)) }
@@ -159,6 +174,8 @@ function stripTokenFromUrl(): void {
 
 let sessionExpiryTimer: ReturnType<typeof setTimeout> | undefined
 function clearLanSession(reason = ''): void {
+  requestController.abort()
+  requestController = new AbortController()
   localCredential = ''
   sessionStorage.removeItem(SESSION_KEY)
   sessionStorage.removeItem(SESSION_EXPIRY_KEY)
@@ -167,6 +184,29 @@ function clearLanSession(reason = ''): void {
     sessionExpiryTimer = undefined
   }
   stopPolling()
+  runs.value = []
+  runsOffline.value = false
+  runsLoading.value = false
+  deciding.value = ''
+  messages.value = []
+  draft.value = ''
+  sending.value = false
+  archiving.value = false
+  powerBusy.value = false
+  ctxOpen.value = false
+  ctxLoading.value = false
+  ctxInfo.value = null
+  ctxError.value = ''
+  powerKnown.value = false
+  preventSleep.value = false
+  deviceName.value = ''
+  manualToken.value = ''
+  toast.value = ''
+  if (toastTimer !== undefined) {
+    clearTimeout(toastTimer)
+    toastTimer = undefined
+  }
+  verifying.value = false
   phase.value = 'failed'
   if (reason) failReason.value = reason
 }
@@ -187,6 +227,7 @@ function armSessionExpiry(expiresAt: string): boolean {
 
 function handleSessionAuthError(e: unknown): boolean {
   if (!mounted) return true
+  if (e instanceof DOMException && e.name === 'AbortError') return true
   if (!isAuthError(e)) return false
   clearLanSession('局域网会话已失效或被关闭，请从桌面端重新配对。')
   return true
@@ -194,12 +235,13 @@ function handleSessionAuthError(e: unknown): boolean {
 
 async function verify(candidate: string) {
   if (verifying.value || phase.value === 'paired') return
+  const controller = requestController
   verifying.value = true
   phase.value = 'verifying'
   failReason.value = ''
   try {
     const res = await apiPost<unknown>('/system/lan/verify', { token: candidate }, pairingRequestOptions())
-    if (!mounted) return
+    if (!isActiveRequest(controller)) return
     const r = asRecord(res)
     const rejected = r !== null && (r.ok === false || r.paired === false || r.verified === false || r.success === false)
     if (rejected) throw new Error(pickStr(r, ['message', 'detail', 'error']) || '令牌未通过校验')
@@ -207,7 +249,7 @@ async function verify(candidate: string) {
     const sessionCredential = r ? pickStr(r, ['session_credential']) : ''
     const expiresAt = r ? pickStr(r, ['expires_at']) : ''
     if (!sessionCredential || !expiresAt) throw new Error('后端未返回有效的局域网会话凭证')
-    if (!mounted) return
+    if (!isActiveRequest(controller)) return
     localCredential = sessionCredential
     sessionStorage.setItem(SESSION_KEY, sessionCredential)
     sessionStorage.setItem(SESSION_EXPIRY_KEY, expiresAt)
@@ -216,12 +258,12 @@ async function verify(candidate: string) {
     stripTokenFromUrl()
     startMain()
   } catch (e) {
-    if (!mounted) return
+    if (!isActiveRequest(controller)) return
     localCredential = ''
     phase.value = 'failed'
     failReason.value = maskToken(platformErrText(e), candidate)
   } finally {
-    if (mounted) verifying.value = false
+    if (isActiveRequest(controller)) verifying.value = false
   }
 }
 
@@ -283,17 +325,22 @@ function normalizeRuns(payload: unknown): RunItem[] {
 }
 
 async function loadRuns() {
+  const controller = requestController
   try {
     const res = await mobileGet<unknown>('/agents/runs')
+    if (!isActiveRequest(controller)) return
     runs.value = normalizeRuns(res)
     runsOffline.value = false
   } catch (e) {
+    if (!isActiveRequest(controller)) return
     if (handleSessionAuthError(e)) return
     const network = isNetworkError(e)
     runs.value = network ? SAMPLE_RUNS : []
     runsOffline.value = network
   } finally {
-    runsLoading.value = false
+    // A cancelled operation may settle after a new pairing has started its
+    // own work. Only that operation's session may release the loading state.
+    if (isActiveRequest(controller)) runsLoading.value = false
   }
 }
 
@@ -303,9 +350,11 @@ async function decide(run: RunItem, approved: boolean) {
     showToast('示例数据不可操作，待后端接入后再试。')
     return
   }
+  const controller = requestController
   deciding.value = run.id
   try {
     const result = await mobilePost<{ status?: string }>(`/agents/runs/${run.id}/approve`, { approved })
+    if (!isActiveRequest(controller)) return
     const actual = result.status
     if (actual === 'rejected') {
       showToast(`已拒绝「${run.title}」`)
@@ -316,9 +365,10 @@ async function decide(run: RunItem, approved: boolean) {
     }
     await loadRuns()
   } catch (e) {
+    if (!isActiveRequest(controller)) return
     if (!handleSessionAuthError(e)) showToast(`操作失败：${platformErrText(e)}`)
   } finally {
-    deciding.value = ''
+    if (isActiveRequest(controller)) deciding.value = ''
   }
 }
 
@@ -347,35 +397,41 @@ function extractReply(payload: unknown): string {
 async function sendChat() {
   const text = draft.value.trim()
   if (!text || sending.value) return
+  const controller = requestController
   sending.value = true
   draft.value = ''
   pushMsg('me', text)
   try {
     const res = await mobilePost<unknown>('/agents/chat', { message: text })
+    if (!isActiveRequest(controller)) return
     const reply = extractReply(res)
     pushMsg('agent', reply || '口信已送达，智能体思索中，进展见上方任务列表。')
   } catch (e) {
+    if (!isActiveRequest(controller)) return
     if (!handleSessionAuthError(e)) pushMsg('sys', `发送失败：${platformErrText(e)}`)
   } finally {
-    sending.value = false
+    if (isActiveRequest(controller)) sending.value = false
   }
 }
 
 /* ── 快捷操作 ── */
 async function archiveDreams() {
   if (archiving.value) return
+  const controller = requestController
   archiving.value = true
   try {
     const res = await mobilePost<unknown>('/memory/dreams/archive-now')
+    if (!isActiveRequest(controller)) return
     const r = asRecord(res)
     const n = r ? pickNum(r, ['archived', 'archived_count', 'count', 'total']) : NaN
     const simulated = r !== null && (r.simulated === true || r.stub === true)
     const base = Number.isFinite(n) ? `已归档 ${n} 段梦境` : '梦境整理请求已送达'
     showToast(simulated ? `${base}（模拟）` : base)
   } catch (e) {
+    if (!isActiveRequest(controller)) return
     if (!handleSessionAuthError(e)) showToast(`整理失败：${platformErrText(e)}`)
   } finally {
-    archiving.value = false
+    if (isActiveRequest(controller)) archiving.value = false
   }
 }
 
@@ -389,8 +445,10 @@ function normalizePower(payload: unknown): boolean | null {
   return null
 }
 async function loadPower() {
+  const controller = requestController
   try {
     const res = await mobileGet<unknown>('/system/power')
+    if (!isActiveRequest(controller)) return
     const v = normalizePower(res)
     if (v === null) {
       powerKnown.value = false
@@ -399,27 +457,31 @@ async function loadPower() {
       powerKnown.value = true
     }
   } catch (e) {
+    if (!isActiveRequest(controller)) return
     if (handleSessionAuthError(e)) return
     powerKnown.value = false
   }
 }
 async function togglePower() {
   if (powerBusy.value) return
+  const controller = requestController
   powerBusy.value = true
   const next = powerKnown.value ? !preventSleep.value : true
   try {
     const res = await mobilePut<unknown>('/system/power', { prevent_sleep: next, gear: 'device' })
+    if (!isActiveRequest(controller)) return
     const v = normalizePower(res)
     preventSleep.value = v ?? next
     powerKnown.value = true
     showToast(preventSleep.value ? '防睡眠已开启，设备将保持清醒' : '防睡眠已关闭')
   } catch (e) {
+    if (!isActiveRequest(controller)) return
     if (!handleSessionAuthError(e)) {
       showToast(`切换失败：${platformErrText(e)}`)
       await loadPower()
     }
   } finally {
-    powerBusy.value = false
+    if (isActiveRequest(controller)) powerBusy.value = false
   }
 }
 
@@ -444,18 +506,21 @@ function normalizeCtx(payload: unknown): CtxInfo | null {
   }
 }
 async function openContext() {
+  const controller = requestController
   ctxOpen.value = true
   ctxLoading.value = true
   ctxInfo.value = null
   ctxError.value = ''
   try {
     const res = await mobileGet<unknown>('/agents/context-size')
+    if (!isActiveRequest(controller)) return
     ctxInfo.value = normalizeCtx(res)
     if (!ctxInfo.value) ctxError.value = '后端已响应，但未返回可识别的上下文体量字段。'
   } catch (e) {
+    if (!isActiveRequest(controller)) return
     if (!handleSessionAuthError(e)) ctxError.value = platformErrText(e)
   } finally {
-    ctxLoading.value = false
+    if (isActiveRequest(controller)) ctxLoading.value = false
   }
 }
 function fmtNum(n: number): string {
@@ -472,6 +537,7 @@ function stopPolling() {
 }
 function startMain() {
   stopPolling()
+  runsLoading.value = true
   void loadRuns()
   void loadPower()
   pollTimer = setInterval(() => { void loadRuns() }, 5000)

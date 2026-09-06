@@ -152,3 +152,43 @@ def test_same_provider_can_have_legacy_and_scoped_records(client):
         for key, value in raw.items()
         if key.startswith(providers_mod._OWNER_KEY_PREFIX)
     )
+
+
+def test_deleting_updated_legacy_provider_does_not_restore_old_credentials(client):
+    from backend.app.platform_api import providers as providers_mod
+    from backend.app.security import encryption
+
+    providers_mod._store.set(
+        "openai",
+        {
+            "enabled": True,
+            "model": "legacy-model",
+            "api_key_encrypted": encryption.encrypt("test-legacy-provider-key"),
+        },
+    )
+    # Another owner can keep a separate configuration during legacy migration.
+    created_b = client.put(
+        "/platform/providers/configs/openai",
+        json={"model": "owner-b-model", "enabled": True},
+        headers=HEADERS_B,
+    )
+    assert created_b.status_code == 200, created_b.text
+    updated_a = client.put(
+        "/platform/providers/configs/openai",
+        json={"model": "updated-model"},
+        headers=HEADERS_A,
+    )
+    assert updated_a.status_code == 200, updated_a.text
+
+    deleted = client.delete("/platform/providers/configs/openai", headers=HEADERS_A)
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["removed"] is True
+    listed_a = client.get("/platform/providers/configs", headers=HEADERS_A)
+    openai_a = next(item for item in listed_a.json() if item["pid"] == "openai")
+    assert openai_a["configured"] is False
+    assert openai_a["has_api_key"] is False
+    listed_b = client.get("/platform/providers/configs", headers=HEADERS_B)
+    openai_b = next(item for item in listed_b.json() if item["pid"] == "openai")
+    assert openai_b["configured"] is True
+    assert openai_b["model"] == "owner-b-model"
+    assert "openai" not in providers_mod._store.all()

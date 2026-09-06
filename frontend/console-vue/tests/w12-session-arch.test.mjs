@@ -6,8 +6,10 @@ import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { runInNewContext } from 'node:vm'
 
 import { createServer } from 'vite'
+import ts from 'typescript'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const configFile = path.join(root, 'vite.config.ts')
@@ -231,6 +233,190 @@ test('platform.ts/MobileView: LAN credential is request-local and unmount aborts
   assert.ok(mobile.includes('requestController.abort()'), '卸载未中止请求')
   assert.ok(mobile.includes('if (!mounted) return'), '缺少卸载后的异步守卫')
   assert.ok(mobile.includes('clearTimeout(sessionExpiryTimer)'), '卸载未清理会话过期定时器')
+})
+
+async function mobileHarness(send, initialSession = true) {
+  const source = await readSrc('views/platform/MobileView.vue')
+  const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
+  const { outputText } = ts.transpileModule(`${script}\nexport const controls = {
+    verify, unpair, loadRuns, phase, runs, messages, runsLoading,
+    decide, deciding, sendChat, draft, sending, archiveDreams, archiving,
+    togglePower, powerBusy, openContext, ctxLoading,
+  }`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } })
+  const stored = new Map(initialSession ? [
+    ['wanwei-mobile-session', 'lan_old_test'],
+    ['wanwei-mobile-session-expiry', new Date(Date.now() + 60_000).toISOString()],
+  ] : [])
+  const timeouts = new Map()
+  const intervals = new Map()
+  let nextTimer = 1
+  let mount
+  let unmount
+  const exports = {}
+  const authError = () => Object.assign(new Error('expired'), { status: 401 })
+  const platform = {
+    apiGet: (url, options) => send(url, undefined, options),
+    apiPost: (url, body, options) => send(url, body, options),
+    apiPut: (url, body, options) => send(url, body, options),
+    isAuthError: error => error?.status === 401 || error?.status === 403,
+    isNetworkError: error => error instanceof TypeError,
+  }
+  runInNewContext(outputText, {
+    exports, AbortController, DOMException, Date,
+    sessionStorage: {
+      getItem: key => stored.get(key) ?? null,
+      setItem: (key, value) => stored.set(key, value),
+      removeItem: key => stored.delete(key),
+    },
+    setTimeout: (fn, ms) => { const id = nextTimer++; timeouts.set(id, { fn, ms }); return id },
+    clearTimeout: id => timeouts.delete(id),
+    setInterval: (fn, ms) => { const id = nextTimer++; intervals.set(id, { fn, ms }); return id },
+    clearInterval: id => intervals.delete(id),
+    require: id => {
+      if (id === 'vue') return {
+        ref: value => ({ value }), computed: get => ({ get value() { return get() } }),
+        nextTick: fn => Promise.resolve().then(fn),
+        onMounted: fn => { mount = fn }, onBeforeUnmount: fn => { unmount = fn },
+      }
+      if (id === 'vue-router') return { useRoute: () => ({ query: {} }), useRouter: () => ({ replace: async () => {} }) }
+      if (id === '@/api/platform') return platform
+      throw new Error(`Unexpected component dependency: ${id}`)
+    },
+  })
+  return { ...exports.controls, mount, unmount, stored, timeouts, intervals, authError }
+}
+
+test('MobileView: unpair cancels requests and removes old session data', async () => {
+  const calls = []
+  const mobile = await mobileHarness(async (url, _body, options) => {
+    calls.push({ url, options })
+    return url === '/agents/runs' ? { items: [{ id: 'private-old-run' }] } : { prevent_sleep: false }
+  })
+  mobile.mount()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(mobile.runs.value[0].id, 'private-old-run')
+  mobile.unpair()
+  assert.ok(calls.every(call => call.options.signal.aborted), 'requests for the removed session remain active')
+  assert.equal(mobile.runs.value.length, 0)
+  assert.equal(mobile.messages.value.length, 0)
+  assert.equal(mobile.stored.has('wanwei-mobile-session'), false)
+  assert.equal(mobile.intervals.size, 0)
+  mobile.unmount()
+})
+
+for (const oldResponse of ['success', 'unauthorized']) {
+  test(`MobileView: late ${oldResponse} from an old session cannot replace a new session`, async () => {
+    let completeOldRequest
+    const mobile = await mobileHarness((url, _body, options) => {
+      if (url === '/system/lan/verify') {
+        assert.equal(options.credential, '')
+        return Promise.resolve({ ok: true, session_credential: 'lan_new_test', expires_at: new Date(Date.now() + 60_000).toISOString() })
+      }
+      if (url === '/agents/runs' && options.credential === 'lan_old_test') {
+        return new Promise((resolve, reject) => {
+          completeOldRequest = () => oldResponse === 'success'
+            ? resolve({ items: [{ id: 'private-old-run' }] }) : reject(mobile.authError())
+        })
+      }
+      return Promise.resolve(url === '/agents/runs' ? { items: [{ id: 'new-run' }] } : { prevent_sleep: false })
+    })
+    mobile.mount()
+    mobile.unpair()
+    await mobile.verify('new-pairing-token')
+    await new Promise(resolve => setImmediate(resolve))
+    completeOldRequest()
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(mobile.phase.value, 'paired')
+    assert.equal(mobile.stored.get('wanwei-mobile-session'), 'lan_new_test')
+    assert.equal(mobile.runs.value[0].id, 'new-run')
+    mobile.unmount()
+  })
+}
+
+const mobileActions = [
+  {
+    name: 'approval', path: '/agents/runs/review-run/approve', busy: 'deciding',
+    activeValue: 'review-run', idleValue: '', response: { status: 'approved' },
+    start: mobile => mobile.decide({ id: 'review-run', title: 'Review' }, true),
+  },
+  {
+    name: 'chat', path: '/agents/chat', busy: 'sending',
+    activeValue: true, idleValue: false, response: { reply: 'Reply' },
+    start: mobile => { mobile.draft.value = 'Message'; return mobile.sendChat() },
+  },
+  {
+    name: 'archive', path: '/memory/dreams/archive-now', busy: 'archiving',
+    activeValue: true, idleValue: false, response: { archived: 1 },
+    start: mobile => mobile.archiveDreams(),
+  },
+  {
+    name: 'power', path: '/system/power', busy: 'powerBusy',
+    activeValue: true, idleValue: false, response: { prevent_sleep: true },
+    start: mobile => mobile.togglePower(),
+  },
+  {
+    name: 'context', path: '/agents/context-size', busy: 'ctxLoading',
+    activeValue: true, idleValue: false, response: { tokens: 20, max_tokens: 100 },
+    start: mobile => mobile.openContext(),
+  },
+]
+
+for (const action of mobileActions) {
+  for (const oldResponse of ['success', 'unauthorized']) {
+    test(`MobileView: late ${oldResponse} preserves new ${action.name} busy state`, async t => {
+      const pending = []
+      const mobile = await mobileHarness((url, body, options) => {
+        if (url === '/system/lan/verify') return Promise.resolve({
+          session_credential: 'lan_new_test', expires_at: new Date(Date.now() + 60_000).toISOString(),
+        })
+        // The power action also has an independent startup GET request.
+        if (url === action.path && (action.name !== 'power' || body !== undefined)) {
+          return new Promise((resolve, reject) => pending.push({ resolve, reject, credential: options.credential }))
+        }
+        return Promise.resolve(url === '/agents/runs' ? { items: [] } : { prevent_sleep: false })
+      })
+      t.after(() => mobile.unmount())
+      mobile.mount()
+      const oldOperation = action.start(mobile)
+      assert.equal(mobile[action.busy].value, action.activeValue)
+      mobile.unpair()
+      assert.equal(mobile[action.busy].value, action.idleValue, 'old operation still blocks a new session')
+      await mobile.verify('new-pairing-token')
+      const newOperation = action.start(mobile)
+      assert.equal(pending.length, 2)
+      assert.equal(pending[1].credential, 'lan_new_test')
+      if (oldResponse === 'success') pending[0].resolve(action.response)
+      else pending[0].reject(mobile.authError())
+      await oldOperation
+      assert.equal(mobile.phase.value, 'paired')
+      assert.equal(mobile[action.busy].value, action.activeValue, 'old cleanup released the new operation')
+      pending[1].resolve(action.response)
+      await newOperation
+      assert.equal(mobile[action.busy].value, action.idleValue)
+    })
+  }
+}
+
+test('MobileView: a cancelled run load cannot hide a new session loading state', async t => {
+  const pending = []
+  const mobile = await mobileHarness(url => {
+    if (url === '/system/lan/verify') return Promise.resolve({
+      session_credential: 'lan_new_test', expires_at: new Date(Date.now() + 60_000).toISOString(),
+    })
+    if (url === '/agents/runs') return new Promise(resolve => pending.push(resolve))
+    return Promise.resolve({ prevent_sleep: false })
+  })
+  t.after(() => mobile.unmount())
+  mobile.mount()
+  mobile.unpair()
+  await mobile.verify('new-pairing-token')
+  pending[0]({ items: [] })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(mobile.runsLoading.value, true)
+  pending[1]({ items: [{ id: 'new-run' }] })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(mobile.runsLoading.value, false)
+  assert.equal(mobile.runs.value[0].id, 'new-run')
 })
 
 test('HelpView: 本机反馈可查看/导出/复制（08-#38）', async () => {

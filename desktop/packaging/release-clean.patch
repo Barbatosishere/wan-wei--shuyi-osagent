@@ -271,10 +271,10 @@ index bdbfa1e..5ea7173 100644
  
 diff --git a/backend/app/platform_api/mobile_remote.py b/backend/app/platform_api/mobile_remote.py
 deleted file mode 100644
-index 006afb5..0000000
+index 3f0fe60..0000000
 --- a/backend/app/platform_api/mobile_remote.py
 +++ /dev/null
-@@ -1,487 +0,0 @@
+@@ -1,499 +0,0 @@
 -"""手机端远程控制补充 API：实时事件流 / 工具调用实时查询 / 文件上传。
 -
 -为宛委枢忆手机端 APP（meoo-app）提供 orca/mobile 风格的远程控制能力：
@@ -301,7 +301,7 @@ index 006afb5..0000000
 -from fastapi.responses import StreamingResponse
 -
 -from ..audit.service import list_logs, record
--from ..db import get_conn
+-from ..db import get_conn, transaction
 -from ..security.auth import _lan_session_identity
 -from ..security.input_limits import MOBILE_UPLOAD_MAX_FILE_BYTES
 -from ..soul.ownership import actor_id_for_request, configured_actor_id
@@ -572,6 +572,31 @@ index 006afb5..0000000
 -    conn.commit()
 -
 -
+-def _register_uploaded_file(file_id: str, file: UploadFile, size_bytes: int, owner_id: str) -> None:
+-    from ..utils.datetime_utils import utc_now_iso
+-
+-    conn = get_conn()
+-    _file_meta_table(conn)
+-    quota_clause = 'owner_id=?'
+-    if _legacy_owner_allowed(owner_id):
+-        quota_clause += " OR owner_id IS NULL OR owner_id=''"
+-    with transaction(immediate=True) as conn:
+-        # Serialize the quota decision with registration so simultaneous
+-        # uploads cannot each spend the same remaining allowance. The shared
+-        # transaction also rejects writes after the database file is replaced.
+-        quota = conn.execute(
+-            f'SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM mobile_files WHERE {quota_clause}',
+-            (owner_id,),
+-        ).fetchone()
+-        if quota[0] >= MAX_FILES or quota[1] + size_bytes > MAX_TOTAL_BYTES:
+-            raise HTTPException(413, 'upload quota exceeded')
+-        conn.execute(
+-            'INSERT INTO mobile_files(file_id,filename,size_bytes,content_type,created_at,owner_id) '
+-            'VALUES (?,?,?,?,?,?)',
+-            (file_id, file.filename or 'unnamed', size_bytes, file.content_type or '', utc_now_iso(), owner_id),
+-        )
+-
+-
 -@router.post('/upload')
 -async def upload_file(
 -    request: Request,
@@ -581,7 +606,7 @@ index 006afb5..0000000
 -    """上传文件到后端存储，AI 可通过 canonical content URL 读取。"""
 -    owner_id = actor_id_for_request(request)
 -    file_id = 'file_' + uuid.uuid4().hex[:12]
--    MAX_BYTES = MOBILE_UPLOAD_MAX_FILE_BYTES
+-    max_bytes = MOBILE_UPLOAD_MAX_FILE_BYTES
 -
 -    # 预检：优先用 file.size，回退 Content-Length 头；超限直接 413 不落盘
 -    declared = getattr(file, 'size', None) or 0
@@ -590,44 +615,31 @@ index 006afb5..0000000
 -            declared = int(file.headers.get('content-length', 0))
 -        except (ValueError, TypeError):
 -            declared = 0
--    if declared > MAX_BYTES:
+-    if declared > max_bytes:
 -        raise HTTPException(413, '文件超过 50MB 限制')
 -
 -    dest = _ensure_upload_dir() / file_id
 -    total = 0
--    CHUNK = 256 * 1024  # 256KB chunks
--
--    with dest.open('wb') as fh:
--        while True:
--            chunk = await file.read(CHUNK)
--            if not chunk:
--                break
--            total += len(chunk)
--            if total > MAX_BYTES:
+-    chunk_size = 256 * 1024
+-    created = registered = False
+-    try:
+-        with dest.open('xb') as output:
+-            created = True
+-            while chunk := await file.read(chunk_size):
+-                total += len(chunk)
+-                if total > max_bytes:
+-                    raise HTTPException(413, '文件超过 50MB 限制')
+-                output.write(chunk)
+-        _register_uploaded_file(file_id, file, total, owner_id)
+-        registered = True
+-    finally:
+-        # Cancellation also reaches this cleanup. Close the handle first for
+-        # Windows, and never remove an existing file after exclusive-open fails.
+-        if created and not registered:
+-            try:
 -                dest.unlink(missing_ok=True)
--                raise HTTPException(413, '文件超过 50MB 限制')
--            fh.write(chunk)
--
--    conn = get_conn()
--    _file_meta_table(conn)
--    quota_clause = "owner_id=?"
--    quota_params = [owner_id]
--    if _legacy_owner_allowed(owner_id):
--        quota_clause += " OR owner_id IS NULL OR owner_id=''"
--    quota = conn.execute(
--        f'SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM mobile_files WHERE {quota_clause}',
--        quota_params,
--    ).fetchone()
--    if quota[0] >= MAX_FILES or quota[1] + total > MAX_TOTAL_BYTES:
--        dest.unlink(missing_ok=True)
--        raise HTTPException(413, 'upload quota exceeded')
--    from ..utils.datetime_utils import utc_now_iso
--    conn.execute(
--        'INSERT INTO mobile_files(file_id,filename,size_bytes,content_type,created_at,owner_id) '
--        'VALUES (?,?,?,?,?,?)',
--        (file_id, file.filename or 'unnamed', total, file.content_type or '', utc_now_iso(), owner_id),
--    )
--    conn.commit()
+-            except OSError:
+-                logger.warning('failed to remove unregistered mobile upload %s', file_id)
 -
 -    record(
 -        'file_upload',
@@ -1033,10 +1045,10 @@ index 071d55c..34b8d16 100644
            </div>
 diff --git a/frontend/console-vue/src/views/platform/MobileView.vue b/frontend/console-vue/src/views/platform/MobileView.vue
 deleted file mode 100644
-index b04f06a..0000000
+index ccb25d9..0000000
 --- a/frontend/console-vue/src/views/platform/MobileView.vue
 +++ /dev/null
-@@ -1,1189 +0,0 @@
+@@ -1,1255 +0,0 @@
 -<script setup lang="ts">
 -/**
 - * 手机伴侣 — 局域网手机控制页（路由 /mobile）。
@@ -1105,16 +1117,31 @@ index b04f06a..0000000
 -const verifying = ref(false)
 -const manualToken = ref('')
 -let mounted = false
--const requestController = new AbortController()
+-let requestController = new AbortController()
 -let localCredential = ''
 -const requestOptions = (): ReqOptions => ({ signal: requestController.signal, credential: localCredential })
 -const pairingRequestOptions = (): ReqOptions => ({ signal: requestController.signal, credential: '' })
--// A response may settle after abort (for example while parsing its body).
+-function isActiveRequest(controller: AbortController): boolean {
+-  return mounted && controller === requestController && !controller.signal.aborted
+-}
+-function assertActiveRequest(controller: AbortController): void {
+-  if (!isActiveRequest(controller)) throw new DOMException('Mobile session ended', 'AbortError')
+-}
+-
+-// Body parsing can settle after abort. Keep both success and error responses
+-// from a former session from changing a newly paired session's state.
 -async function mobileRequest<T>(send: (options: ReqOptions) => Promise<T>): Promise<T> {
--  if (!mounted) throw new DOMException('Mobile view unmounted', 'AbortError')
--  const result = await send(requestOptions())
--  if (!mounted) throw new DOMException('Mobile view unmounted', 'AbortError')
--  return result
+-  const controller = requestController
+-  assertActiveRequest(controller)
+-  if (phase.value !== 'paired' || !localCredential) throw new DOMException('Mobile session ended', 'AbortError')
+-  try {
+-    const result = await send(requestOptions())
+-    assertActiveRequest(controller)
+-    return result
+-  } catch (error) {
+-    assertActiveRequest(controller)
+-    throw error
+-  }
 -}
 -function mobileGet<T>(path: string): Promise<T> { return mobileRequest(options => apiGet<T>(path, options)) }
 -function mobilePost<T>(path: string, body?: unknown): Promise<T> { return mobileRequest(options => apiPost<T>(path, body, options)) }
@@ -1198,6 +1225,8 @@ index b04f06a..0000000
 -
 -let sessionExpiryTimer: ReturnType<typeof setTimeout> | undefined
 -function clearLanSession(reason = ''): void {
+-  requestController.abort()
+-  requestController = new AbortController()
 -  localCredential = ''
 -  sessionStorage.removeItem(SESSION_KEY)
 -  sessionStorage.removeItem(SESSION_EXPIRY_KEY)
@@ -1206,6 +1235,29 @@ index b04f06a..0000000
 -    sessionExpiryTimer = undefined
 -  }
 -  stopPolling()
+-  runs.value = []
+-  runsOffline.value = false
+-  runsLoading.value = false
+-  deciding.value = ''
+-  messages.value = []
+-  draft.value = ''
+-  sending.value = false
+-  archiving.value = false
+-  powerBusy.value = false
+-  ctxOpen.value = false
+-  ctxLoading.value = false
+-  ctxInfo.value = null
+-  ctxError.value = ''
+-  powerKnown.value = false
+-  preventSleep.value = false
+-  deviceName.value = ''
+-  manualToken.value = ''
+-  toast.value = ''
+-  if (toastTimer !== undefined) {
+-    clearTimeout(toastTimer)
+-    toastTimer = undefined
+-  }
+-  verifying.value = false
 -  phase.value = 'failed'
 -  if (reason) failReason.value = reason
 -}
@@ -1226,6 +1278,7 @@ index b04f06a..0000000
 -
 -function handleSessionAuthError(e: unknown): boolean {
 -  if (!mounted) return true
+-  if (e instanceof DOMException && e.name === 'AbortError') return true
 -  if (!isAuthError(e)) return false
 -  clearLanSession('局域网会话已失效或被关闭，请从桌面端重新配对。')
 -  return true
@@ -1233,12 +1286,13 @@ index b04f06a..0000000
 -
 -async function verify(candidate: string) {
 -  if (verifying.value || phase.value === 'paired') return
+-  const controller = requestController
 -  verifying.value = true
 -  phase.value = 'verifying'
 -  failReason.value = ''
 -  try {
 -    const res = await apiPost<unknown>('/system/lan/verify', { token: candidate }, pairingRequestOptions())
--    if (!mounted) return
+-    if (!isActiveRequest(controller)) return
 -    const r = asRecord(res)
 -    const rejected = r !== null && (r.ok === false || r.paired === false || r.verified === false || r.success === false)
 -    if (rejected) throw new Error(pickStr(r, ['message', 'detail', 'error']) || '令牌未通过校验')
@@ -1246,7 +1300,7 @@ index b04f06a..0000000
 -    const sessionCredential = r ? pickStr(r, ['session_credential']) : ''
 -    const expiresAt = r ? pickStr(r, ['expires_at']) : ''
 -    if (!sessionCredential || !expiresAt) throw new Error('后端未返回有效的局域网会话凭证')
--    if (!mounted) return
+-    if (!isActiveRequest(controller)) return
 -    localCredential = sessionCredential
 -    sessionStorage.setItem(SESSION_KEY, sessionCredential)
 -    sessionStorage.setItem(SESSION_EXPIRY_KEY, expiresAt)
@@ -1255,12 +1309,12 @@ index b04f06a..0000000
 -    stripTokenFromUrl()
 -    startMain()
 -  } catch (e) {
--    if (!mounted) return
+-    if (!isActiveRequest(controller)) return
 -    localCredential = ''
 -    phase.value = 'failed'
 -    failReason.value = maskToken(platformErrText(e), candidate)
 -  } finally {
--    if (mounted) verifying.value = false
+-    if (isActiveRequest(controller)) verifying.value = false
 -  }
 -}
 -
@@ -1322,17 +1376,22 @@ index b04f06a..0000000
 -}
 -
 -async function loadRuns() {
+-  const controller = requestController
 -  try {
 -    const res = await mobileGet<unknown>('/agents/runs')
+-    if (!isActiveRequest(controller)) return
 -    runs.value = normalizeRuns(res)
 -    runsOffline.value = false
 -  } catch (e) {
+-    if (!isActiveRequest(controller)) return
 -    if (handleSessionAuthError(e)) return
 -    const network = isNetworkError(e)
 -    runs.value = network ? SAMPLE_RUNS : []
 -    runsOffline.value = network
 -  } finally {
--    runsLoading.value = false
+-    // A cancelled operation may settle after a new pairing has started its
+-    // own work. Only that operation's session may release the loading state.
+-    if (isActiveRequest(controller)) runsLoading.value = false
 -  }
 -}
 -
@@ -1342,9 +1401,11 @@ index b04f06a..0000000
 -    showToast('示例数据不可操作，待后端接入后再试。')
 -    return
 -  }
+-  const controller = requestController
 -  deciding.value = run.id
 -  try {
 -    const result = await mobilePost<{ status?: string }>(`/agents/runs/${run.id}/approve`, { approved })
+-    if (!isActiveRequest(controller)) return
 -    const actual = result.status
 -    if (actual === 'rejected') {
 -      showToast(`已拒绝「${run.title}」`)
@@ -1355,9 +1416,10 @@ index b04f06a..0000000
 -    }
 -    await loadRuns()
 -  } catch (e) {
+-    if (!isActiveRequest(controller)) return
 -    if (!handleSessionAuthError(e)) showToast(`操作失败：${platformErrText(e)}`)
 -  } finally {
--    deciding.value = ''
+-    if (isActiveRequest(controller)) deciding.value = ''
 -  }
 -}
 -
@@ -1386,35 +1448,41 @@ index b04f06a..0000000
 -async function sendChat() {
 -  const text = draft.value.trim()
 -  if (!text || sending.value) return
+-  const controller = requestController
 -  sending.value = true
 -  draft.value = ''
 -  pushMsg('me', text)
 -  try {
 -    const res = await mobilePost<unknown>('/agents/chat', { message: text })
+-    if (!isActiveRequest(controller)) return
 -    const reply = extractReply(res)
 -    pushMsg('agent', reply || '口信已送达，智能体思索中，进展见上方任务列表。')
 -  } catch (e) {
+-    if (!isActiveRequest(controller)) return
 -    if (!handleSessionAuthError(e)) pushMsg('sys', `发送失败：${platformErrText(e)}`)
 -  } finally {
--    sending.value = false
+-    if (isActiveRequest(controller)) sending.value = false
 -  }
 -}
 -
 -/* ── 快捷操作 ── */
 -async function archiveDreams() {
 -  if (archiving.value) return
+-  const controller = requestController
 -  archiving.value = true
 -  try {
 -    const res = await mobilePost<unknown>('/memory/dreams/archive-now')
+-    if (!isActiveRequest(controller)) return
 -    const r = asRecord(res)
 -    const n = r ? pickNum(r, ['archived', 'archived_count', 'count', 'total']) : NaN
 -    const simulated = r !== null && (r.simulated === true || r.stub === true)
 -    const base = Number.isFinite(n) ? `已归档 ${n} 段梦境` : '梦境整理请求已送达'
 -    showToast(simulated ? `${base}（模拟）` : base)
 -  } catch (e) {
+-    if (!isActiveRequest(controller)) return
 -    if (!handleSessionAuthError(e)) showToast(`整理失败：${platformErrText(e)}`)
 -  } finally {
--    archiving.value = false
+-    if (isActiveRequest(controller)) archiving.value = false
 -  }
 -}
 -
@@ -1428,8 +1496,10 @@ index b04f06a..0000000
 -  return null
 -}
 -async function loadPower() {
+-  const controller = requestController
 -  try {
 -    const res = await mobileGet<unknown>('/system/power')
+-    if (!isActiveRequest(controller)) return
 -    const v = normalizePower(res)
 -    if (v === null) {
 -      powerKnown.value = false
@@ -1438,27 +1508,31 @@ index b04f06a..0000000
 -      powerKnown.value = true
 -    }
 -  } catch (e) {
+-    if (!isActiveRequest(controller)) return
 -    if (handleSessionAuthError(e)) return
 -    powerKnown.value = false
 -  }
 -}
 -async function togglePower() {
 -  if (powerBusy.value) return
+-  const controller = requestController
 -  powerBusy.value = true
 -  const next = powerKnown.value ? !preventSleep.value : true
 -  try {
 -    const res = await mobilePut<unknown>('/system/power', { prevent_sleep: next, gear: 'device' })
+-    if (!isActiveRequest(controller)) return
 -    const v = normalizePower(res)
 -    preventSleep.value = v ?? next
 -    powerKnown.value = true
 -    showToast(preventSleep.value ? '防睡眠已开启，设备将保持清醒' : '防睡眠已关闭')
 -  } catch (e) {
+-    if (!isActiveRequest(controller)) return
 -    if (!handleSessionAuthError(e)) {
 -      showToast(`切换失败：${platformErrText(e)}`)
 -      await loadPower()
 -    }
 -  } finally {
--    powerBusy.value = false
+-    if (isActiveRequest(controller)) powerBusy.value = false
 -  }
 -}
 -
@@ -1483,18 +1557,21 @@ index b04f06a..0000000
 -  }
 -}
 -async function openContext() {
+-  const controller = requestController
 -  ctxOpen.value = true
 -  ctxLoading.value = true
 -  ctxInfo.value = null
 -  ctxError.value = ''
 -  try {
 -    const res = await mobileGet<unknown>('/agents/context-size')
+-    if (!isActiveRequest(controller)) return
 -    ctxInfo.value = normalizeCtx(res)
 -    if (!ctxInfo.value) ctxError.value = '后端已响应，但未返回可识别的上下文体量字段。'
 -  } catch (e) {
+-    if (!isActiveRequest(controller)) return
 -    if (!handleSessionAuthError(e)) ctxError.value = platformErrText(e)
 -  } finally {
--    ctxLoading.value = false
+-    if (isActiveRequest(controller)) ctxLoading.value = false
 -  }
 -}
 -function fmtNum(n: number): string {
@@ -1511,6 +1588,7 @@ index b04f06a..0000000
 -}
 -function startMain() {
 -  stopPolling()
+-  runsLoading.value = true
 -  void loadRuns()
 -  void loadPower()
 -  pollTimer = setInterval(() => { void loadRuns() }, 5000)

@@ -1202,6 +1202,10 @@ def floating_workspace(request: Request):
     items = []
     changed = False
     for sid, sess in list(sessions.items()):
+        # Run retention can remove the linked run before the session expires.
+        # The session's persisted owner remains authoritative in that interval.
+        if not _run_visible(sess, owner_id):
+            continue
         run = _runs.get(sess.get('run_id', ''))
         if run and not _run_visible(run, owner_id):
             continue

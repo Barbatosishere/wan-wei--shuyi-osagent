@@ -4,6 +4,17 @@
 
 ## Unreleased
 
+### 2026-09-06 - PR #215 安全隔离、远程会话与发布验证
+
+- **Security · 身份与 owner 隔离**：保留配置 owner 的注册门槛，统一 key hash 唯一约束和轮换碰撞保护；agent/team/run、provider/gateway、workflow/audit 与移动文件按 owner 隔离。浮动会话在关联运行清理后仍校验自身 owner，后台及定时工作流审计归属持久化执行主体。
+- **Security · 凭证事务**：身份与 LAN 凭证写入使用独立事务并检查数据库文件身份，不提交业务调用方事务；撤销目标不属于当前身份时不区分其注册或活跃状态。身份完全停用后，关联 LAN 会话也失效；数据库访问失败不再被当作撤销成功。
+- **Security · 远程连接**：LAN 配对使用一次性 token 与独立短期 session credential，不下发桌面主 API key；MCP SSE 初始地址与 endpoint 分别执行 SSRF 校验并绑定 IP、Host 与 SNI。
+- **Fixed · 会话与文件**：手机解除配对、过期和重新配对会中止旧请求并清理状态，旧响应与结束回调不会影响新会话；上传失败或取消时清理未登记文件，配额检查与登记使用同一事务。删除 Provider 配置同时移除当前 owner 的旧兼容副本，避免旧凭据重新生效。
+- **Fixed · 身份 API**：非法 key 字段返回 422，轮换 key 冲突返回 409，并保持原身份和凭证状态不变。
+- **Fixed · LAN Origin**：来源校验使用后端实际监听端口，命令行 `--port` 优先于环境变量，避免自定义端口下的合法请求被拒绝。
+- **Changed · 发布链**：发布清理补丁与最终移动源码同步，只作用于 staging；保留 Electron 冷启动 LAN 撤销、绑定核对及 owner 校验的关闭接口。新增发布树行为回归，核对清理范围和共享认证模块。
+- **Documentation**：补充身份、LAN、迁移及回滚说明；修正前端 Node 要求、未配置模型时的行为、桌面安装包示例和 Windows 构建目录命令。
+
 ### 2026-09-05 - 安全修复：identity 注册门槛 + DB 身份指纹（#211 / #213）
 - **#211 identity 注册门槛**：`actor_id_from_api_key` 自动注册**仅限配置的 owner key**（环境变量/密钥文件来源）——此前任何首次见到的 key（含回环免密 GET 携带的任意值）都会静默落库成永久凭据，绕过 rotate/revoke；陌生 key 改为派生稳定 ID（作用域隔离，看到自己的空 scope）**不落库**，owner key 首次使用照常完成身份引导（个人单 key 使用零变化）；轮换测试按新语义更新（原 4 条测试锁定的正是漏洞行为）。
 - **#211 回环误判修复**：`_is_loopback_bound` 实际绑定地址取进程参数 `--host` 优先于 `WANWEI_HOST` 环境声明——`uvicorn --host 0.0.0.0` 启动而 env 未设时不再误判回环（回环免密静默对外生效）；`_loopback_origin_allowlist` 端口同理取 `--port` 优先（与实际监听一致，同源写不再被 403）。
