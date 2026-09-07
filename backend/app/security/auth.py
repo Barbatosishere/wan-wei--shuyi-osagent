@@ -365,10 +365,14 @@ def _lan_session_identity(credential: str) -> str | None:
     """
     if not credential.startswith("lan_") or not _lan_session_table_ready():
         return None
-    from ..db import _db_path
+    from ..db import _db_path, assert_db_identity
 
     conn = sqlite3.connect(str(_db_path()), timeout=5)
     try:
+        # Same replacement guard as _credential_transaction: after a database
+        # swap or removal this connection opened the wrong identity store and
+        # must fail closed instead of answering from it.
+        assert_db_identity()
         row = conn.execute(
             "SELECT session.identity_id, session.expires_at, session.revoked_at "
             "FROM lan_sessions AS session WHERE session.credential_hash=? "

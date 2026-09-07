@@ -271,10 +271,10 @@ index bdbfa1e..5ea7173 100644
  
 diff --git a/backend/app/platform_api/mobile_remote.py b/backend/app/platform_api/mobile_remote.py
 deleted file mode 100644
-index 3f0fe60..0000000
+index f6ed9c1..0000000
 --- a/backend/app/platform_api/mobile_remote.py
 +++ /dev/null
-@@ -1,499 +0,0 @@
+@@ -1,508 +0,0 @@
 -"""手机端远程控制补充 API：实时事件流 / 工具调用实时查询 / 文件上传。
 -
 -为宛委枢忆手机端 APP（meoo-app）提供 orca/mobile 风格的远程控制能力：
@@ -562,14 +562,20 @@ index 3f0fe60..0000000
 -    return _legacy_owner_allowed(owner_id)
 -
 -
--def _claim_legacy_file(conn, row, owner_id: str) -> None:
--    if row['owner_id'] or not _legacy_owner_allowed(owner_id):
+-def _claim_legacy_files(file_ids: list[str], owner_id: str) -> None:
+-    """Bind ownerless historical rows to the configured actor in one write.
+-
+-    Called from read-only GET handlers, so it must not commit on the shared
+-    thread-local connection — a stray commit there could flush unrelated
+-    pending writes. One guarded transaction per request instead.
+-    """
+-    if not file_ids or not _legacy_owner_allowed(owner_id):
 -        return
--    conn.execute(
--        "UPDATE mobile_files SET owner_id=? WHERE file_id=? AND (owner_id IS NULL OR owner_id='')",
--        (owner_id, row['file_id']),
--    )
--    conn.commit()
+-    with transaction(immediate=True) as conn:
+-        conn.executemany(
+-            "UPDATE mobile_files SET owner_id=? WHERE file_id=? AND (owner_id IS NULL OR owner_id='')",
+-            [(owner_id, file_id) for file_id in file_ids],
+-        )
 -
 -
 -def _register_uploaded_file(file_id: str, file: UploadFile, size_bytes: int, owner_id: str) -> None:
@@ -585,7 +591,7 @@ index 3f0fe60..0000000
 -        # uploads cannot each spend the same remaining allowance. The shared
 -        # transaction also rejects writes after the database file is replaced.
 -        quota = conn.execute(
--            f'SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM mobile_files WHERE {quota_clause}',
+-            'SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM mobile_files WHERE ' + quota_clause,
 -            (owner_id,),
 -        ).fetchone()
 -        if quota[0] >= MAX_FILES or quota[1] + size_bytes > MAX_TOTAL_BYTES:
@@ -676,8 +682,10 @@ index 3f0fe60..0000000
 -        'ORDER BY created_at DESC LIMIT ?',
 -        (owner_id, limit),
 -    ).fetchall()
--    for row in rows:
--        _claim_legacy_file(conn, row, owner_id)
+-    if _legacy_owner_allowed(owner_id):
+-        _claim_legacy_files(
+-            [str(row['file_id']) for row in rows if not row['owner_id']], owner_id,
+-        )
 -    return {
 -        'items': [
 -            {
@@ -711,7 +719,8 @@ index 3f0fe60..0000000
 -    ).fetchone()
 -    if row is None or not _file_visible(row, owner_id):
 -        raise HTTPException(404, '文件不存在')
--    _claim_legacy_file(conn, row, owner_id)
+-    if not row['owner_id']:
+-        _claim_legacy_files([str(row['file_id'])], owner_id)
 -    stored_id = str(row['file_id'])
 -
 -    # 第三道：对服务端取回的值再确认形态，并做前缀归属校验
@@ -775,7 +784,7 @@ index 3f0fe60..0000000
 -    await _append_event({'event_type': 'file_delete', 'file_id': file_id, 'owner_id': owner_id})
 -    return {'deleted': file_id}
 diff --git a/desktop/src/main.js b/desktop/src/main.js
-index 5fa3846..df73ab6 100644
+index 9b31cce..3aff398 100644
 --- a/desktop/src/main.js
 +++ b/desktop/src/main.js
 @@ -60,11 +60,7 @@ let quitting = false;
@@ -790,7 +799,7 @@ index 5fa3846..df73ab6 100644
  
  // ------------------------------------------------------------- small helpers
  
-@@ -518,18 +514,6 @@ function lanIPv4s() {
+@@ -524,18 +520,6 @@ function lanIPv4s() {
    return candidates;
  }
  
@@ -809,7 +818,7 @@ index 5fa3846..df73ab6 100644
  /** 导航白名单：仅允许控制台自身（http://127.0.0.1:<port>/），其余一律视为外站 */
  function isConsoleUrl(url, port = backendPort) {
    return typeof url === 'string' && url.startsWith(`http://127.0.0.1:${port}/`);
-@@ -550,7 +534,7 @@ function isTrustedFrame(frame) {
+@@ -556,7 +540,7 @@ function isTrustedFrame(frame) {
    try { return isConsoleUrl(frame && frame.url); } catch { return false; }
  }
  
@@ -818,7 +827,7 @@ index 5fa3846..df73ab6 100644
  function injectApiKeyForSession(sess) {
    sess.webRequest.onBeforeSendHeaders(
      { urls: [`http://127.0.0.1:${backendPort}/*`] },
-@@ -627,70 +611,6 @@ function setPreventSleep(enable, mode) {
+@@ -633,70 +617,6 @@ function setPreventSleep(enable, mode) {
    return getPreventSleep();
  }
  
@@ -889,7 +898,7 @@ index 5fa3846..df73ab6 100644
  
  // --------------------------------------------------------- window state
  function loadWindowState() {
-@@ -775,7 +695,7 @@ function createTray() {
+@@ -781,7 +701,7 @@ function createTray() {
    });
  }
  
@@ -898,7 +907,7 @@ index 5fa3846..df73ab6 100644
  function refreshTray() {
    if (!tray || tray.isDestroyed()) return;
    const openInBrowser = `http://127.0.0.1:${backendPort}/console/`;
-@@ -786,14 +706,7 @@ function refreshTray() {
+@@ -792,14 +712,7 @@ function refreshTray() {
      { label: '任务期间阻止睡眠', type: 'checkbox', checked: getPreventSleep().enabled,
        sublabel: preventSleepMode === 'display' ? '含屏幕常亮' : '仅阻止系统挂起',
        click: (item) => setPreventSleep(item.checked, preventSleepMode) },
@@ -913,7 +922,7 @@ index 5fa3846..df73ab6 100644
    items.push(
      { type: 'separator' },
      { label: '开机自启动', type: 'checkbox', checked: getAutostart(),
-@@ -933,31 +846,6 @@ function registerIpc() {
+@@ -939,31 +852,6 @@ function registerIpc() {
      setPreventSleep(!!enable, mode));
    handle('desktop:get-prevent-sleep', () => getPreventSleep());
  
@@ -945,7 +954,7 @@ index 5fa3846..df73ab6 100644
  }
  
  // ------------------------------------------------------------------- boot
-@@ -978,7 +866,7 @@ if (!gotLock) {
+@@ -984,7 +872,7 @@ if (!gotLock) {
      }
      // 真实异步探测空闲端口（原 findFreePortSync 恒回退 8010，已删除，见上方说明）
      backendPort = await findFreePort();
@@ -954,7 +963,7 @@ index 5fa3846..df73ab6 100644
      injectApiKeyForSession(session.defaultSession);
      registerIpc();
  
-@@ -1020,7 +908,6 @@ if (process.env.WANWEI_DESKTOP_TEST_EXPORTS === '1') {
+@@ -1026,7 +914,6 @@ if (process.env.WANWEI_DESKTOP_TEST_EXPORTS === '1') {
    module.exports = {
      findFreePort,
      truncateLogIfNeeded,
@@ -962,7 +971,7 @@ index 5fa3846..df73ab6 100644
      isConsoleUrl,
      isTrustedFrame,
      isVisibleOnSomeDisplay,
-@@ -1031,7 +918,5 @@ if (process.env.WANWEI_DESKTOP_TEST_EXPORTS === '1') {
+@@ -1037,7 +924,5 @@ if (process.env.WANWEI_DESKTOP_TEST_EXPORTS === '1') {
      probeBackendEnv,
      backendExecutionRemedyHint,
      ensureBackendEnv,
@@ -1044,10 +1053,10 @@ index 071d55c..34b8d16 100644
            </div>
 diff --git a/frontend/console-vue/src/views/platform/MobileView.vue b/frontend/console-vue/src/views/platform/MobileView.vue
 deleted file mode 100644
-index 7e37e50..0000000
+index a6fad18..0000000
 --- a/frontend/console-vue/src/views/platform/MobileView.vue
 +++ /dev/null
-@@ -1,1266 +0,0 @@
+@@ -1,1257 +0,0 @@
 -<script setup lang="ts">
 -/**
 - * 手机伴侣 — 局域网手机控制页（路由 /mobile）。
@@ -1106,8 +1115,9 @@ index 7e37e50..0000000
 -}
 -
 -/* ── 配对态 ── */
--const SESSION_KEY = 'wanwei-mobile-session'
--const SESSION_EXPIRY_KEY = 'wanwei-mobile-session-expiry'
+-// The LAN session credential is kept in memory only. Browser storage
+-// (sessionStorage/localStorage) is off-limits for secrets, so a page reload
+-// always requires a fresh pairing link from the desktop.
 -const route = useRoute()
 -const router = useRouter()
 -const phase = ref<Phase>('verifying')
@@ -1227,8 +1237,6 @@ index 7e37e50..0000000
 -  requestController.abort()
 -  requestController = new AbortController()
 -  localCredential = ''
--  sessionStorage.removeItem(SESSION_KEY)
--  sessionStorage.removeItem(SESSION_EXPIRY_KEY)
 -  if (sessionExpiryTimer) {
 -    clearTimeout(sessionExpiryTimer)
 -    sessionExpiryTimer = undefined
@@ -1301,8 +1309,6 @@ index 7e37e50..0000000
 -    if (!sessionCredential || !expiresAt) throw new Error('后端未返回有效的局域网会话凭证')
 -    if (!isActiveRequest(controller)) return
 -    localCredential = sessionCredential
--    sessionStorage.setItem(SESSION_KEY, sessionCredential)
--    sessionStorage.setItem(SESSION_EXPIRY_KEY, expiresAt)
 -    if (!armSessionExpiry(expiresAt)) return
 -    phase.value = 'paired'
 -    stripTokenFromUrl()
@@ -1611,20 +1617,14 @@ index 7e37e50..0000000
 -onMounted(() => {
 -  mounted = true
 -  const candidate = pairingTokenFromRoute()
--  // An explicit pairing link takes priority over a cached, possibly revoked session.
+-  // An explicit pairing link takes priority over any previous session.
 -  if (candidate) {
 -    clearLanSession()
 -    void verify(candidate)
 -    return
 -  }
--  const sessionCredential = sessionStorage.getItem(SESSION_KEY)?.trim() ?? ''
--  const expiresAt = sessionStorage.getItem(SESSION_EXPIRY_KEY)?.trim() ?? ''
--  if (sessionCredential && armSessionExpiry(expiresAt)) {
--    localCredential = sessionCredential
--    phase.value = 'paired'
--    startMain()
--    return
--  }
+-  // No credential survives a reload (in-memory only), so without a pairing
+-  // token there is nothing to resume.
 -  clearLanSession()
 -  failReason.value = '链接中未携带配对令牌（token），请从桌面端重新获取配对链接或二维码。'
 -})

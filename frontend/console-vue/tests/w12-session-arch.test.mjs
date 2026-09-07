@@ -244,32 +244,44 @@ async function mobileHarness(send, initialSession = true, initialQuery = {}) {
     decide, deciding, sendChat, draft, sending, archiveDreams, archiving,
     togglePower, powerBusy, openContext, ctxLoading,
   }`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } })
-  const stored = new Map(initialSession ? [
-    ['wanwei-mobile-session', 'lan_old_test'],
-    ['wanwei-mobile-session-expiry', new Date(Date.now() + 60_000).toISOString()],
-  ] : [])
   const timeouts = new Map()
   const intervals = new Map()
-  const route = reactive({ query: initialQuery })
+  // initialSession establishes an in-memory old session by completing a real
+  // pairing flow at mount; browser storage must stay untouched.
+  const route = reactive({
+    query: initialSession && initialQuery.token === undefined
+      ? { token: 'seed-old-pairing-token' }
+      : initialQuery,
+  })
+  const storageAccesses = []
   const watcherStops = []
   let nextTimer = 1
   let mount
   let unmount
   const exports = {}
   const authError = () => Object.assign(new Error('expired'), { status: 401 })
+  const sendWithSeed = (url, body, options) => {
+    if (url === '/system/lan/verify' && body && body.token === 'seed-old-pairing-token') {
+      return Promise.resolve({
+        session_credential: 'lan_old_test',
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+      })
+    }
+    return send(url, body, options)
+  }
   const platform = {
-    apiGet: (url, options) => send(url, undefined, options),
-    apiPost: (url, body, options) => send(url, body, options),
-    apiPut: (url, body, options) => send(url, body, options),
+    apiGet: (url, options) => sendWithSeed(url, undefined, options),
+    apiPost: (url, body, options) => sendWithSeed(url, body, options),
+    apiPut: (url, body, options) => sendWithSeed(url, body, options),
     isAuthError: error => error?.status === 401 || error?.status === 403,
     isNetworkError: error => error instanceof TypeError,
   }
   runInNewContext(outputText, {
     exports, AbortController, DOMException, Date,
     sessionStorage: {
-      getItem: key => stored.get(key) ?? null,
-      setItem: (key, value) => stored.set(key, value),
-      removeItem: key => stored.delete(key),
+      getItem: key => { storageAccesses.push(['getItem', key]); return null },
+      setItem: (key, value) => { storageAccesses.push(['setItem', key, value]) },
+      removeItem: key => { storageAccesses.push(['removeItem', key]) },
     },
     setTimeout: (fn, ms) => { const id = nextTimer++; timeouts.set(id, { fn, ms }); return id },
     clearTimeout: id => timeouts.delete(id),
@@ -291,12 +303,12 @@ async function mobileHarness(send, initialSession = true, initialQuery = {}) {
     },
   })
   return {
-    ...exports.controls, mount, stored, timeouts, intervals, authError, route,
+    ...exports.controls, mount, storageAccesses, timeouts, intervals, authError, route,
     unmount: () => { unmount(); watcherStops.forEach(stop => stop()) },
   }
 }
 
-test('MobileView: a fresh pairing URL takes precedence over the cached session', async t => {
+test('MobileView: a fresh pairing URL pairs on mount without browser storage', async t => {
   const calls = []
   const mobile = await mobileHarness(async (url, body, options) => {
     calls.push({ url, body, options })
@@ -313,7 +325,7 @@ test('MobileView: a fresh pairing URL takes precedence over the cached session',
   assert.equal(calls[0].options.credential, '')
   assert.ok(calls.slice(1).every(call => call.options.credential === 'lan_new_test'))
   assert.equal(mobile.phase.value, 'paired')
-  assert.equal(mobile.stored.get('wanwei-mobile-session'), 'lan_new_test')
+  assert.deepEqual(mobile.storageAccesses, [])
   assert.equal(mobile.runs.value[0].id, 'new-run')
   assert.equal(mobile.route.query.token, undefined)
 })
@@ -333,19 +345,22 @@ test('MobileView: changing the pairing URL on the mounted page replaces the old 
   })
   t.after(() => mobile.unmount())
   mobile.mount()
+  await new Promise(resolve => setImmediate(resolve))
   mobile.route.query = { token: 'replacement-pairing-token' }
   await new Promise(resolve => setImmediate(resolve))
-  const pairing = calls.find(call => call.url === '/system/lan/verify')
+  const pairing = calls.find(call => call.url === '/system/lan/verify'
+    && call.body.token === 'replacement-pairing-token')
   assert.ok(pairing, 'a new URL token did not start pairing in the reused component')
-  assert.equal(pairing.body.token, 'replacement-pairing-token')
   assert.equal(pairing.options.credential, '')
+  assert.ok(calls.some(call => call.options.credential === 'lan_old_test'), 'seed pairing never issued an old-credential request')
   assert.ok(calls.filter(call => call.options.credential === 'lan_old_test').every(call => call.options.signal.aborted))
   finishOldRuns({ items: [{ id: 'private-old-run' }] })
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(mobile.phase.value, 'paired')
-  assert.equal(mobile.stored.get('wanwei-mobile-session'), 'lan_new_test')
+  assert.deepEqual(mobile.storageAccesses, [])
   assert.equal(mobile.runs.value[0].id, 'new-run')
-  assert.equal(calls.filter(call => call.url === '/system/lan/verify').length, 1)
+  assert.equal(calls.filter(call => call.url === '/system/lan/verify'
+    && call.body.token === 'replacement-pairing-token').length, 1)
   assert.equal(mobile.route.query.token, undefined)
 })
 
@@ -362,7 +377,7 @@ test('MobileView: unpair cancels requests and removes old session data', async (
   assert.ok(calls.every(call => call.options.signal.aborted), 'requests for the removed session remain active')
   assert.equal(mobile.runs.value.length, 0)
   assert.equal(mobile.messages.value.length, 0)
-  assert.equal(mobile.stored.has('wanwei-mobile-session'), false)
+  assert.deepEqual(mobile.storageAccesses, [])
   assert.equal(mobile.intervals.size, 0)
   mobile.unmount()
 })
@@ -384,13 +399,14 @@ for (const oldResponse of ['success', 'unauthorized']) {
       return Promise.resolve(url === '/agents/runs' ? { items: [{ id: 'new-run' }] } : { prevent_sleep: false })
     })
     mobile.mount()
+    await new Promise(resolve => setImmediate(resolve))
     mobile.unpair()
     await mobile.verify('new-pairing-token')
     await new Promise(resolve => setImmediate(resolve))
     completeOldRequest()
     await new Promise(resolve => setImmediate(resolve))
     assert.equal(mobile.phase.value, 'paired')
-    assert.equal(mobile.stored.get('wanwei-mobile-session'), 'lan_new_test')
+    assert.deepEqual(mobile.storageAccesses, [])
     assert.equal(mobile.runs.value[0].id, 'new-run')
     mobile.unmount()
   })
@@ -440,6 +456,7 @@ for (const action of mobileActions) {
       })
       t.after(() => mobile.unmount())
       mobile.mount()
+      await new Promise(resolve => setImmediate(resolve))
       const oldOperation = action.start(mobile)
       assert.equal(mobile[action.busy].value, action.activeValue)
       mobile.unpair()
@@ -471,6 +488,7 @@ test('MobileView: a cancelled run load cannot hide a new session loading state',
   })
   t.after(() => mobile.unmount())
   mobile.mount()
+  await new Promise(resolve => setImmediate(resolve))
   mobile.unpair()
   await mobile.verify('new-pairing-token')
   pending[0]({ items: [] })

@@ -259,7 +259,13 @@ function logBackendProbeFailure(diagnostics) {
 function backendExecutionRemedyHint(environmentDir, diagnostics) {
   const hint = '已保留依赖环境。请检查文件权限、noexec 挂载及安全策略；'
     + '确认是 KySec 拒绝且依赖文件来源可信后，再授权对应文件。';
-  const match = String(diagnostics.stderr || '').match(/ImportError:\s*([^\r\n]+?\.so):\s*failed to map segment from shared object/i);
+  // Match within a single line and bound the path capture: an unbounded lazy
+  // class on multi-line loader output can backtrack quadratically (CodeQL).
+  const denialLine = String(diagnostics.stderr || '').split(/\r?\n/)
+    .find((entry) => /failed to map segment from shared object/i.test(entry));
+  const match = denialLine
+    ? denialLine.match(/ImportError:\s*([^\r\n]{1,512}?\.so):/i)
+    : null;
   if (!match) return hint;
 
   try {

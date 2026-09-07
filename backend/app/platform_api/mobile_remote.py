@@ -285,14 +285,20 @@ def _file_visible(row, owner_id: str) -> bool:
     return _legacy_owner_allowed(owner_id)
 
 
-def _claim_legacy_file(conn, row, owner_id: str) -> None:
-    if row['owner_id'] or not _legacy_owner_allowed(owner_id):
+def _claim_legacy_files(file_ids: list[str], owner_id: str) -> None:
+    """Bind ownerless historical rows to the configured actor in one write.
+
+    Called from read-only GET handlers, so it must not commit on the shared
+    thread-local connection — a stray commit there could flush unrelated
+    pending writes. One guarded transaction per request instead.
+    """
+    if not file_ids or not _legacy_owner_allowed(owner_id):
         return
-    conn.execute(
-        "UPDATE mobile_files SET owner_id=? WHERE file_id=? AND (owner_id IS NULL OR owner_id='')",
-        (owner_id, row['file_id']),
-    )
-    conn.commit()
+    with transaction(immediate=True) as conn:
+        conn.executemany(
+            "UPDATE mobile_files SET owner_id=? WHERE file_id=? AND (owner_id IS NULL OR owner_id='')",
+            [(owner_id, file_id) for file_id in file_ids],
+        )
 
 
 def _register_uploaded_file(file_id: str, file: UploadFile, size_bytes: int, owner_id: str) -> None:
@@ -308,7 +314,7 @@ def _register_uploaded_file(file_id: str, file: UploadFile, size_bytes: int, own
         # uploads cannot each spend the same remaining allowance. The shared
         # transaction also rejects writes after the database file is replaced.
         quota = conn.execute(
-            f'SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM mobile_files WHERE {quota_clause}',
+            'SELECT COUNT(*), COALESCE(SUM(size_bytes),0) FROM mobile_files WHERE ' + quota_clause,
             (owner_id,),
         ).fetchone()
         if quota[0] >= MAX_FILES or quota[1] + size_bytes > MAX_TOTAL_BYTES:
@@ -399,8 +405,10 @@ def list_files(request: Request, limit: int = Query(50, ge=1, le=200)):
         'ORDER BY created_at DESC LIMIT ?',
         (owner_id, limit),
     ).fetchall()
-    for row in rows:
-        _claim_legacy_file(conn, row, owner_id)
+    if _legacy_owner_allowed(owner_id):
+        _claim_legacy_files(
+            [str(row['file_id']) for row in rows if not row['owner_id']], owner_id,
+        )
     return {
         'items': [
             {
@@ -434,7 +442,8 @@ def _file_path_from_db(file_id: str, owner_id: str) -> Path:
     ).fetchone()
     if row is None or not _file_visible(row, owner_id):
         raise HTTPException(404, '文件不存在')
-    _claim_legacy_file(conn, row, owner_id)
+    if not row['owner_id']:
+        _claim_legacy_files([str(row['file_id'])], owner_id)
     stored_id = str(row['file_id'])
 
     # 第三道：对服务端取回的值再确认形态，并做前缀归属校验

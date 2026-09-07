@@ -56,8 +56,9 @@ interface CtxInfo {
 }
 
 /* ── 配对态 ── */
-const SESSION_KEY = 'wanwei-mobile-session'
-const SESSION_EXPIRY_KEY = 'wanwei-mobile-session-expiry'
+// The LAN session credential is kept in memory only. Browser storage
+// (sessionStorage/localStorage) is off-limits for secrets, so a page reload
+// always requires a fresh pairing link from the desktop.
 const route = useRoute()
 const router = useRouter()
 const phase = ref<Phase>('verifying')
@@ -177,8 +178,6 @@ function clearLanSession(reason = ''): void {
   requestController.abort()
   requestController = new AbortController()
   localCredential = ''
-  sessionStorage.removeItem(SESSION_KEY)
-  sessionStorage.removeItem(SESSION_EXPIRY_KEY)
   if (sessionExpiryTimer) {
     clearTimeout(sessionExpiryTimer)
     sessionExpiryTimer = undefined
@@ -251,8 +250,6 @@ async function verify(candidate: string) {
     if (!sessionCredential || !expiresAt) throw new Error('后端未返回有效的局域网会话凭证')
     if (!isActiveRequest(controller)) return
     localCredential = sessionCredential
-    sessionStorage.setItem(SESSION_KEY, sessionCredential)
-    sessionStorage.setItem(SESSION_EXPIRY_KEY, expiresAt)
     if (!armSessionExpiry(expiresAt)) return
     phase.value = 'paired'
     stripTokenFromUrl()
@@ -561,20 +558,14 @@ watch(pairingTokenFromRoute, candidate => {
 onMounted(() => {
   mounted = true
   const candidate = pairingTokenFromRoute()
-  // An explicit pairing link takes priority over a cached, possibly revoked session.
+  // An explicit pairing link takes priority over any previous session.
   if (candidate) {
     clearLanSession()
     void verify(candidate)
     return
   }
-  const sessionCredential = sessionStorage.getItem(SESSION_KEY)?.trim() ?? ''
-  const expiresAt = sessionStorage.getItem(SESSION_EXPIRY_KEY)?.trim() ?? ''
-  if (sessionCredential && armSessionExpiry(expiresAt)) {
-    localCredential = sessionCredential
-    phase.value = 'paired'
-    startMain()
-    return
-  }
+  // No credential survives a reload (in-memory only), so without a pairing
+  // token there is nothing to resume.
   clearLanSession()
   failReason.value = '链接中未携带配对令牌（token），请从桌面端重新获取配对链接或二维码。'
 })
