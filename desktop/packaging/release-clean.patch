@@ -775,23 +775,22 @@ index 3f0fe60..0000000
 -    await _append_event({'event_type': 'file_delete', 'file_id': file_id, 'owner_id': owner_id})
 -    return {'deleted': file_id}
 diff --git a/desktop/src/main.js b/desktop/src/main.js
-index c1c61d5..4c97a6f 100644
+index 5fa3846..df73ab6 100644
 --- a/desktop/src/main.js
 +++ b/desktop/src/main.js
-@@ -60,11 +60,7 @@
+@@ -60,11 +60,7 @@ let quitting = false;
  let powerSaveBlockerId = null;       // 当前 blocker id，null 表示未启用
  let preventSleepMode = 'app';        // 'app' 阻止系统挂起 | 'display' 连同屏幕常亮
  
 -// 局域网手机控制状态
 -let lanState = { enabled: false, url: '' };
--
+ 
 -// 浮动工作区小窗
 -let floatingWin = null;
-+
  
  // ------------------------------------------------------------- small helpers
  
-@@ -453,18 +449,6 @@
+@@ -518,18 +514,6 @@ function lanIPv4s() {
    return candidates;
  }
  
@@ -810,7 +809,7 @@ index c1c61d5..4c97a6f 100644
  /** 导航白名单：仅允许控制台自身（http://127.0.0.1:<port>/），其余一律视为外站 */
  function isConsoleUrl(url, port = backendPort) {
    return typeof url === 'string' && url.startsWith(`http://127.0.0.1:${port}/`);
-@@ -485,7 +469,7 @@
+@@ -550,7 +534,7 @@ function isTrustedFrame(frame) {
    try { return isConsoleUrl(frame && frame.url); } catch { return false; }
  }
  
@@ -819,7 +818,7 @@ index c1c61d5..4c97a6f 100644
  function injectApiKeyForSession(sess) {
    sess.webRequest.onBeforeSendHeaders(
      { urls: [`http://127.0.0.1:${backendPort}/*`] },
-@@ -562,70 +546,6 @@
+@@ -627,70 +611,6 @@ function setPreventSleep(enable, mode) {
    return getPreventSleep();
  }
  
@@ -890,7 +889,7 @@ index c1c61d5..4c97a6f 100644
  
  // --------------------------------------------------------- window state
  function loadWindowState() {
-@@ -710,7 +630,7 @@
+@@ -775,7 +695,7 @@ function createTray() {
    });
  }
  
@@ -899,7 +898,7 @@ index c1c61d5..4c97a6f 100644
  function refreshTray() {
    if (!tray || tray.isDestroyed()) return;
    const openInBrowser = `http://127.0.0.1:${backendPort}/console/`;
-@@ -721,14 +641,7 @@
+@@ -786,14 +706,7 @@ function refreshTray() {
      { label: '任务期间阻止睡眠', type: 'checkbox', checked: getPreventSleep().enabled,
        sublabel: preventSleepMode === 'display' ? '含屏幕常亮' : '仅阻止系统挂起',
        click: (item) => setPreventSleep(item.checked, preventSleepMode) },
@@ -914,7 +913,7 @@ index c1c61d5..4c97a6f 100644
    items.push(
      { type: 'separator' },
      { label: '开机自启动', type: 'checkbox', checked: getAutostart(),
-@@ -868,31 +781,6 @@
+@@ -933,31 +846,6 @@ function registerIpc() {
      setPreventSleep(!!enable, mode));
    handle('desktop:get-prevent-sleep', () => getPreventSleep());
  
@@ -946,7 +945,7 @@ index c1c61d5..4c97a6f 100644
  }
  
  // ------------------------------------------------------------------- boot
-@@ -913,7 +801,7 @@
+@@ -978,7 +866,7 @@ if (!gotLock) {
      }
      // 真实异步探测空闲端口（原 findFreePortSync 恒回退 8010，已删除，见上方说明）
      backendPort = await findFreePort();
@@ -955,7 +954,7 @@ index c1c61d5..4c97a6f 100644
      injectApiKeyForSession(session.defaultSession);
      registerIpc();
  
-@@ -955,7 +843,6 @@
+@@ -1020,7 +908,6 @@ if (process.env.WANWEI_DESKTOP_TEST_EXPORTS === '1') {
    module.exports = {
      findFreePort,
      truncateLogIfNeeded,
@@ -963,10 +962,10 @@ index c1c61d5..4c97a6f 100644
      isConsoleUrl,
      isTrustedFrame,
      isVisibleOnSomeDisplay,
-@@ -963,7 +850,5 @@
-     decodeFileBuffer,
-     depsMarkerMatches,
-     isBackendEnvHealthy,
+@@ -1031,7 +918,5 @@ if (process.env.WANWEI_DESKTOP_TEST_EXPORTS === '1') {
+     probeBackendEnv,
+     backendExecutionRemedyHint,
+     ensureBackendEnv,
 -    isFloatingWorkspaceVisible,
 -    setFloatingWorkspace,
    };
@@ -1045,10 +1044,10 @@ index 071d55c..34b8d16 100644
            </div>
 diff --git a/frontend/console-vue/src/views/platform/MobileView.vue b/frontend/console-vue/src/views/platform/MobileView.vue
 deleted file mode 100644
-index ccb25d9..0000000
+index 7e37e50..0000000
 --- a/frontend/console-vue/src/views/platform/MobileView.vue
 +++ /dev/null
-@@ -1,1255 +0,0 @@
+@@ -1,1266 +0,0 @@
 -<script setup lang="ts">
 -/**
 - * 手机伴侣 — 局域网手机控制页（路由 /mobile）。
@@ -1063,7 +1062,7 @@ index ccb25d9..0000000
 - *   GET  /agents/context-size                           上下文体量（弹层）
 - * 所有响应均做可选链容错；接口不可达时运行列表回退为「离线示例数据」。
 - */
--import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 -import { useRoute, useRouter } from 'vue-router'
 -import { apiGet, apiPost, apiPut, isAuthError, isNetworkError, type ReqOptions } from '@/api/platform'
 -import { runStatusGroup, runStatusLabel } from '@/utils/platformEnums'
@@ -1325,10 +1324,14 @@ index ccb25d9..0000000
 -  void verify(candidate)
 -}
 -
--function retryPair() {
+-function pairingTokenFromRoute(): string {
 -  const raw = route.query.token
 -  const fromQuery = Array.isArray(raw) ? raw[0] : raw
--  const candidate = typeof fromQuery === 'string' ? fromQuery.trim() : ''
+-  return typeof fromQuery === 'string' ? fromQuery.trim() : ''
+-}
+-
+-function retryPair() {
+-  const candidate = pairingTokenFromRoute()
 -  if (!candidate) {
 -    failReason.value = '链接中未携带配对令牌（token），请从桌面端重新获取配对链接或二维码。'
 -    return
@@ -1597,8 +1600,23 @@ index ccb25d9..0000000
 -  }
 -}
 -
+-// Fragment-only navigation reuses this component. Cancel the previous session
+-// when a fresh pairing link arrives, just as for an explicit local unpair.
+-watch(pairingTokenFromRoute, candidate => {
+-  if (!mounted || !candidate) return
+-  clearLanSession()
+-  void verify(candidate)
+-})
+-
 -onMounted(() => {
 -  mounted = true
+-  const candidate = pairingTokenFromRoute()
+-  // An explicit pairing link takes priority over a cached, possibly revoked session.
+-  if (candidate) {
+-    clearLanSession()
+-    void verify(candidate)
+-    return
+-  }
 -  const sessionCredential = sessionStorage.getItem(SESSION_KEY)?.trim() ?? ''
 -  const expiresAt = sessionStorage.getItem(SESSION_EXPIRY_KEY)?.trim() ?? ''
 -  if (sessionCredential && armSessionExpiry(expiresAt)) {
@@ -1608,15 +1626,7 @@ index ccb25d9..0000000
 -    return
 -  }
 -  clearLanSession()
--  const raw = route.query.token
--  const fromQuery = Array.isArray(raw) ? raw[0] : raw
--  const candidate = typeof fromQuery === 'string' ? fromQuery.trim() : ''
--  if (!candidate) {
--    phase.value = 'failed'
--    failReason.value = '链接中未携带配对令牌（token），请从桌面端重新获取配对链接或二维码。'
--    return
--  }
--  void verify(candidate)
+-  failReason.value = '链接中未携带配对令牌（token），请从桌面端重新获取配对链接或二维码。'
 -})
 -
 -onBeforeUnmount(() => {

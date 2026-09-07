@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -87,3 +88,93 @@ def test_scheduler_audits_use_each_flow_owner(owners, monkeypatch):
     }
     assert all(json.loads(event["payload"])["flow_id"] == flow["id"] for event in owned_events)
     assert audit.list_logs(owner_id=configured_owner) == []
+
+
+@pytest.fixture
+def owner_audit_records(owners):
+    from backend.app.audit import service as audit
+    from backend.app.db import transaction
+
+    configured_owner, other_owner = owners
+    payload = {"trace_id": "audit-owner-boundary"}
+    audit.record("configured-owner-event", payload, owner_id=configured_owner)
+    audit.record("other-owner-event", payload, owner_id=other_owner)
+    with transaction() as conn:
+        conn.execute(
+            "INSERT INTO audit_logs(audit_id, event_type, payload, created_at, owner_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                "audit_ownerless_boundary", "legacy-owner-event", json.dumps(payload),
+                "2026-01-01T00:00:00Z", "",
+            ),
+        )
+    return owners
+
+
+@pytest.mark.parametrize("trace_id", [None, "audit-owner-boundary"])
+def test_audit_reads_without_an_owner_fail_closed(owner_audit_records, monkeypatch, trace_id):
+    from backend.app.audit import service as audit
+    from backend.app.security import auth
+
+    def unavailable_configured_key():
+        raise OSError("injected configured key read failure")
+
+    monkeypatch.setattr(auth, "get_api_key", unavailable_configured_key)
+    with audit.audit_owner_context(None):
+        assert audit.list_logs(trace_id=trace_id) == []
+
+
+@pytest.mark.parametrize("trace_id", [None, "audit-owner-boundary"])
+def test_an_empty_audit_owner_cannot_read_legacy_rows(owner_audit_records, trace_id):
+    from backend.app.audit import service as audit
+
+    assert audit.list_logs(trace_id=trace_id, owner_id="") == []
+
+
+@pytest.mark.parametrize("owner_source", ["explicit", "context"])
+@pytest.mark.parametrize("trace_id", [None, "audit-owner-boundary"])
+def test_audit_owner_scope_survives_configured_key_failure(
+    owner_audit_records, monkeypatch, owner_source, trace_id,
+):
+    from backend.app.audit import service as audit
+    from backend.app.security import auth
+
+    _, other_owner = owner_audit_records
+
+    def unavailable_configured_key():
+        raise OSError("injected configured key read failure")
+
+    monkeypatch.setattr(auth, "get_api_key", unavailable_configured_key)
+    context_owner = other_owner if owner_source == "context" else None
+    explicit_owner = other_owner if owner_source == "explicit" else None
+    with audit.audit_owner_context(context_owner):
+        events = audit.list_logs(trace_id=trace_id, owner_id=explicit_owner)
+    assert [event["event_type"] for event in events] == ["other-owner-event"]
+
+
+def test_audit_trace_fallback_preserves_owner_scope(owner_audit_records, monkeypatch):
+    from backend.app.audit import service as audit
+
+    class ConnectionWithoutJson:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, sql, parameters=()):
+            if "json_extract" in sql:
+                raise sqlite3.OperationalError("no such function: json_extract")
+            return self.connection.execute(sql, parameters)
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+    configured_owner, other_owner = owner_audit_records
+    connection = ConnectionWithoutJson(audit.get_conn())
+    monkeypatch.setattr(audit, "get_conn", lambda: connection)
+    other_events = audit.list_logs(trace_id="audit-owner-boundary", owner_id=other_owner)
+    assert [event["event_type"] for event in other_events] == ["other-owner-event"]
+    configured_events = audit.list_logs(
+        trace_id="audit-owner-boundary", owner_id=configured_owner,
+    )
+    assert {event["event_type"] for event in configured_events} == {
+        "configured-owner-event", "legacy-owner-event",
+    }

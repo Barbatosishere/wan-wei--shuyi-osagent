@@ -6,8 +6,10 @@ import ast
 import re
 import shutil
 import subprocess
+import tarfile
 import threading
 from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -18,7 +20,8 @@ from fastapi.testclient import TestClient
 
 
 ROOT = Path(__file__).resolve().parents[3]
-PATCH = ROOT / "desktop/packaging/release-clean.patch"
+PATCH_PATH = "desktop/packaging/release-clean.patch"
+PATCH = ROOT / PATCH_PATH
 SYSTEM_SERVICE = "backend/app/platform_api/_system_svc_runtime.py"
 MOBILE_SOURCES = (
     "backend/app/platform_api/mobile_remote.py",
@@ -30,37 +33,86 @@ SHARED_SECURITY_SOURCES = (
 )
 
 
-@pytest.fixture
-def staged_release(tmp_path):
-    stage = tmp_path / "release-stage"
-    stage.mkdir()
-    paths = set(MOBILE_SOURCES + SHARED_SECURITY_SOURCES)
-    for line in PATCH.read_text(encoding="utf-8").splitlines():
+def _release_paths(patch: bytes) -> set[str]:
+    # Git apply uses these attributes to normalize historical CRLF source blobs.
+    # Omitting them makes the result depend on the host's core.autocrlf default.
+    paths = set(MOBILE_SOURCES + SHARED_SECURITY_SOURCES + (".gitattributes", PATCH_PATH))
+    for line in patch.decode("utf-8").splitlines():
         match = re.fullmatch(r"diff --git a/(.+) b/\1", line)
         if match:
             paths.add(match.group(1))
+    return paths
 
-    originals = {}
-    for relative in paths:
-        source = ROOT / relative
-        source.resolve().relative_to(ROOT)
-        originals[relative] = source.read_bytes()
-        destination = stage / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(originals[relative])
 
+def _write_staged_source(stage: Path, relative: str, content: bytes) -> None:
+    destination = stage / relative
+    destination.resolve().relative_to(stage.resolve())
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(content)
+
+
+def _apply_release_cleanup(stage: Path, metadata: Path, autocrlf: str) -> None:
     # Use a separate Git directory: pytest's temporary tree may live inside the
     # checkout, where implicit Git discovery would apply paths at the wrong root.
-    metadata = tmp_path / "git-metadata"
     subprocess.run(["git", "init", "--bare", "--quiet", str(metadata)], check=True)
     apply = [
-        "git", "-C", str(stage), f"--git-dir={metadata}",
+        "git", "-c", f"core.autocrlf={autocrlf}",
+        "-C", str(stage), f"--git-dir={metadata}",
         f"--work-tree={stage}", "apply",
     ]
     for flags in (["--check"], []):
-        result = subprocess.run([*apply, *flags, str(PATCH)], capture_output=True, text=True)
+        result = subprocess.run([*apply, *flags, str(stage / PATCH_PATH)], capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
+
+
+@pytest.fixture(params=["false", "true"], ids=["autocrlf-off", "autocrlf-on"])
+def git_autocrlf(request):
+    return request.param
+
+
+@pytest.fixture
+def staged_release(tmp_path, git_autocrlf):
+    stage = tmp_path / "release-stage"
+    stage.mkdir()
+    originals = {}
+    for relative in _release_paths(PATCH.read_bytes()):
+        source = ROOT / relative
+        source.resolve().relative_to(ROOT)
+        originals[relative] = source.read_bytes()
+        _write_staged_source(stage, relative, originals[relative])
+
+    _apply_release_cleanup(stage, tmp_path / "git-metadata", git_autocrlf)
     return SimpleNamespace(path=stage, originals=originals)
+
+
+def test_committed_archive_applies_cleanup_and_preserves_shared_auth(tmp_path, git_autocrlf):
+    # git archive exports committed object bytes without checkout EOL conversion.
+    # The working-tree fixture separately exercises any uncommitted source edits.
+    committed_patch = subprocess.run(
+        ["git", "-C", str(ROOT), "show", f"HEAD:{PATCH_PATH}"],
+        check=True, capture_output=True,
+    ).stdout
+    paths = _release_paths(committed_patch)
+    archive = subprocess.run(
+        ["git", "-C", str(ROOT), "archive", "--format=tar", "HEAD", "--", *sorted(paths)],
+        check=True, capture_output=True,
+    ).stdout
+    stage = tmp_path / "archive-stage"
+    stage.mkdir()
+    originals = {}
+    with tarfile.open(fileobj=BytesIO(archive), mode="r:") as source_archive:
+        for relative in paths:
+            source = source_archive.extractfile(relative)
+            assert source is not None, f"Missing release source: {relative}"
+            with source:
+                originals[relative] = source.read()
+            _write_staged_source(stage, relative, originals[relative])
+
+    _apply_release_cleanup(stage, tmp_path / "archive-git-metadata", git_autocrlf)
+    for relative in MOBILE_SOURCES:
+        assert not (stage / relative).exists()
+    for relative in SHARED_SECURITY_SOURCES:
+        assert (stage / relative).read_bytes() == originals[relative]
 
 
 def test_release_cleanup_is_confined_to_staging_and_preserves_shared_auth(staged_release):

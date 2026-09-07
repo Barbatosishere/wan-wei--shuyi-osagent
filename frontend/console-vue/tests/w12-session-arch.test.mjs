@@ -10,6 +10,7 @@ import { runInNewContext } from 'node:vm'
 
 import { createServer } from 'vite'
 import ts from 'typescript'
+import { reactive, watch } from 'vue'
 
 const root = fileURLToPath(new URL('../', import.meta.url))
 const configFile = path.join(root, 'vite.config.ts')
@@ -235,7 +236,7 @@ test('platform.ts/MobileView: LAN credential is request-local and unmount aborts
   assert.ok(mobile.includes('clearTimeout(sessionExpiryTimer)'), '卸载未清理会话过期定时器')
 })
 
-async function mobileHarness(send, initialSession = true) {
+async function mobileHarness(send, initialSession = true, initialQuery = {}) {
   const source = await readSrc('views/platform/MobileView.vue')
   const script = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
   const { outputText } = ts.transpileModule(`${script}\nexport const controls = {
@@ -249,6 +250,8 @@ async function mobileHarness(send, initialSession = true) {
   ] : [])
   const timeouts = new Map()
   const intervals = new Map()
+  const route = reactive({ query: initialQuery })
+  const watcherStops = []
   let nextTimer = 1
   let mount
   let unmount
@@ -277,14 +280,74 @@ async function mobileHarness(send, initialSession = true) {
         ref: value => ({ value }), computed: get => ({ get value() { return get() } }),
         nextTick: fn => Promise.resolve().then(fn),
         onMounted: fn => { mount = fn }, onBeforeUnmount: fn => { unmount = fn },
+        watch: (...args) => { const stop = watch(...args); watcherStops.push(stop); return stop },
       }
-      if (id === 'vue-router') return { useRoute: () => ({ query: {} }), useRouter: () => ({ replace: async () => {} }) }
+      if (id === 'vue-router') return {
+        useRoute: () => route,
+        useRouter: () => ({ replace: async ({ query }) => { route.query = query } }),
+      }
       if (id === '@/api/platform') return platform
       throw new Error(`Unexpected component dependency: ${id}`)
     },
   })
-  return { ...exports.controls, mount, unmount, stored, timeouts, intervals, authError }
+  return {
+    ...exports.controls, mount, stored, timeouts, intervals, authError, route,
+    unmount: () => { unmount(); watcherStops.forEach(stop => stop()) },
+  }
 }
+
+test('MobileView: a fresh pairing URL takes precedence over the cached session', async t => {
+  const calls = []
+  const mobile = await mobileHarness(async (url, body, options) => {
+    calls.push({ url, body, options })
+    if (url === '/system/lan/verify') return {
+      session_credential: 'lan_new_test', expires_at: new Date(Date.now() + 60_000).toISOString(),
+    }
+    return url === '/agents/runs' ? { items: [{ id: 'new-run' }] } : { prevent_sleep: false }
+  }, true, { token: 'fresh-pairing-token' })
+  t.after(() => mobile.unmount())
+  mobile.mount()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(calls[0].url, '/system/lan/verify')
+  assert.equal(calls[0].body.token, 'fresh-pairing-token')
+  assert.equal(calls[0].options.credential, '')
+  assert.ok(calls.slice(1).every(call => call.options.credential === 'lan_new_test'))
+  assert.equal(mobile.phase.value, 'paired')
+  assert.equal(mobile.stored.get('wanwei-mobile-session'), 'lan_new_test')
+  assert.equal(mobile.runs.value[0].id, 'new-run')
+  assert.equal(mobile.route.query.token, undefined)
+})
+
+test('MobileView: changing the pairing URL on the mounted page replaces the old session', async t => {
+  const calls = []
+  let finishOldRuns
+  const mobile = await mobileHarness((url, body, options) => {
+    calls.push({ url, body, options })
+    if (url === '/system/lan/verify') return Promise.resolve({
+      session_credential: 'lan_new_test', expires_at: new Date(Date.now() + 60_000).toISOString(),
+    })
+    if (url === '/agents/runs' && options.credential === 'lan_old_test') {
+      return new Promise(resolve => { finishOldRuns = resolve })
+    }
+    return Promise.resolve(url === '/agents/runs' ? { items: [{ id: 'new-run' }] } : { prevent_sleep: false })
+  })
+  t.after(() => mobile.unmount())
+  mobile.mount()
+  mobile.route.query = { token: 'replacement-pairing-token' }
+  await new Promise(resolve => setImmediate(resolve))
+  const pairing = calls.find(call => call.url === '/system/lan/verify')
+  assert.ok(pairing, 'a new URL token did not start pairing in the reused component')
+  assert.equal(pairing.body.token, 'replacement-pairing-token')
+  assert.equal(pairing.options.credential, '')
+  assert.ok(calls.filter(call => call.options.credential === 'lan_old_test').every(call => call.options.signal.aborted))
+  finishOldRuns({ items: [{ id: 'private-old-run' }] })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(mobile.phase.value, 'paired')
+  assert.equal(mobile.stored.get('wanwei-mobile-session'), 'lan_new_test')
+  assert.equal(mobile.runs.value[0].id, 'new-run')
+  assert.equal(calls.filter(call => call.url === '/system/lan/verify').length, 1)
+  assert.equal(mobile.route.query.token, undefined)
+})
 
 test('MobileView: unpair cancels requests and removes old session data', async () => {
   const calls = []

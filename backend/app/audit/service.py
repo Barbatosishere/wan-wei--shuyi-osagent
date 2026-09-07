@@ -4,8 +4,8 @@ import contextvars
 import json
 import secrets
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Iterator
 
 from ..db import get_conn
 from ..security.redaction import redact_audit_payload
@@ -122,51 +122,33 @@ def list_logs(
     owner_id: str | None = None,
 ) -> list[dict]:
     capped = max(1, min(limit, 200))
+    read_owner = _read_owner(owner_id)
+    # An unavailable principal is never a request for all audit records. This
+    # also prevents an empty owner from selecting unclaimed legacy rows.
+    if not read_owner:
+        return []
+
     conn = get_conn()
     _ensure_audit_table(conn)
-    read_owner = _read_owner(owner_id)
-    clauses: list[str] = []
-    params: list[object] = []
-    if read_owner is not None:
-        if _legacy_owner_allowed(read_owner):
-            clauses.append("(owner_id=? OR owner_id IS NULL OR owner_id='')")
-        else:
-            clauses.append("owner_id=?")
-        params.append(read_owner)
+    owner_clause = "owner_id=?"
+    if _legacy_owner_allowed(read_owner):
+        owner_clause = "(owner_id=? OR owner_id IS NULL OR owner_id='')"
+    query = "SELECT * FROM audit_logs WHERE " + owner_clause
+    order_and_limit = " ORDER BY created_at DESC LIMIT ?"
     if trace_id:
         try:
-            clauses.append("json_extract(payload,'$.trace_id')=?")
-            params.append(trace_id)
-            query = (
-                "SELECT * FROM audit_logs WHERE "
-                + " AND ".join(clauses)
-                + " ORDER BY created_at DESC LIMIT ?"
-            )
-            rows = conn.execute(query, [*params, capped]).fetchall()
+            rows = conn.execute(
+                query + " AND json_extract(payload,'$.trace_id')=?" + order_and_limit,
+                (read_owner, trace_id, capped),
+            ).fetchall()
         except sqlite3.OperationalError:
             # JSON1 不可用时保留精确 trace_id 的兼容查询。
-            clauses = [c for c in clauses if not c.startswith("json_extract")]
-            params = params[:1] if read_owner is not None else []
-            clauses.append("payload LIKE ? ESCAPE '\\'")
-            params.append(f'%"trace_id": "{_escape_like(trace_id)}"%')
-            query = (
-                "SELECT * FROM audit_logs WHERE "
-                + " AND ".join(clauses)
-                + " ORDER BY created_at DESC LIMIT ?"
-            )
-            rows = conn.execute(query, [*params, capped]).fetchall()
-    else:
-        if clauses:
-            query = (
-                "SELECT * FROM audit_logs WHERE "
-                + " AND ".join(clauses)
-                + " ORDER BY created_at DESC LIMIT ?"
-            )
-            rows = conn.execute(query, [*params, capped]).fetchall()
-        else:
             rows = conn.execute(
-                "SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?", (capped,)
+                query + " AND payload LIKE ? ESCAPE '\\'" + order_and_limit,
+                (read_owner, f'%"trace_id": "{_escape_like(trace_id)}"%', capped),
             ).fetchall()
+    else:
+        rows = conn.execute(query + order_and_limit, (read_owner, capped)).fetchall()
     items = []
     for row in rows:
         item = dict(row)

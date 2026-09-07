@@ -12,7 +12,7 @@
  *   GET  /agents/context-size                           上下文体量（弹层）
  * 所有响应均做可选链容错；接口不可达时运行列表回退为「离线示例数据」。
  */
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { apiGet, apiPost, apiPut, isAuthError, isNetworkError, type ReqOptions } from '@/api/platform'
 import { runStatusGroup, runStatusLabel } from '@/utils/platformEnums'
@@ -274,10 +274,14 @@ function submitManualToken() {
   void verify(candidate)
 }
 
-function retryPair() {
+function pairingTokenFromRoute(): string {
   const raw = route.query.token
   const fromQuery = Array.isArray(raw) ? raw[0] : raw
-  const candidate = typeof fromQuery === 'string' ? fromQuery.trim() : ''
+  return typeof fromQuery === 'string' ? fromQuery.trim() : ''
+}
+
+function retryPair() {
+  const candidate = pairingTokenFromRoute()
   if (!candidate) {
     failReason.value = '链接中未携带配对令牌（token），请从桌面端重新获取配对链接或二维码。'
     return
@@ -546,8 +550,23 @@ function startMain() {
   }
 }
 
+// Fragment-only navigation reuses this component. Cancel the previous session
+// when a fresh pairing link arrives, just as for an explicit local unpair.
+watch(pairingTokenFromRoute, candidate => {
+  if (!mounted || !candidate) return
+  clearLanSession()
+  void verify(candidate)
+})
+
 onMounted(() => {
   mounted = true
+  const candidate = pairingTokenFromRoute()
+  // An explicit pairing link takes priority over a cached, possibly revoked session.
+  if (candidate) {
+    clearLanSession()
+    void verify(candidate)
+    return
+  }
   const sessionCredential = sessionStorage.getItem(SESSION_KEY)?.trim() ?? ''
   const expiresAt = sessionStorage.getItem(SESSION_EXPIRY_KEY)?.trim() ?? ''
   if (sessionCredential && armSessionExpiry(expiresAt)) {
@@ -557,15 +576,7 @@ onMounted(() => {
     return
   }
   clearLanSession()
-  const raw = route.query.token
-  const fromQuery = Array.isArray(raw) ? raw[0] : raw
-  const candidate = typeof fromQuery === 'string' ? fromQuery.trim() : ''
-  if (!candidate) {
-    phase.value = 'failed'
-    failReason.value = '链接中未携带配对令牌（token），请从桌面端重新获取配对链接或二维码。'
-    return
-  }
-  void verify(candidate)
+  failReason.value = '链接中未携带配对令牌（token），请从桌面端重新获取配对链接或二维码。'
 })
 
 onBeforeUnmount(() => {

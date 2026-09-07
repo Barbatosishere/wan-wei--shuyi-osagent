@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+### 2026-09-07 - PR #215 麒麟实机与手机端复验修复
+
+- **Security · 审计读取 fail-closed**：请求身份不可用或为空时审计查询返回空结果，不再退化为读取全部审计记录；空 owner 无法选中未认领的旧记录。JSON1 不可用的 LIKE 兼容查询同样保持 owner 作用域。
+- **Fixed · 手机重配对**：携带新配对 token 的链接优先于本地缓存的旧会话；页面复用（仅 hash 变化）时也会先中止并清理旧会话再兑换新 token，修复旧 session 已被撤销后页面停留在失效状态的问题。
+- **Fixed · 桌面依赖环境与执行策略**：运行时预检保留完整诊断并区分「疑似执行策略拦截」（如 KySec、noexec、EACCES/EPERM）与普通损坏：前者保留已安装环境和待激活候选、提示逐文件授权（`kyexectl -g`/`-s -o`），授权后重启原地复检，不再死循环重建；后者照旧自动重建。staging 目录改为稳定路径并拆分 `.deps-installed`/`.deps-ok` 标记，未通过运行时检查的候选不会被标记为健康。探针失败日志脱敏后再落盘。
+- **Fixed · 发布清理补丁可移植性**：发布 staging 测试携带 `.gitattributes` 并按 `core.autocrlf` 两种取值参数化，修复无属性配置且 autocrlf=false 的主机上补丁无法应用的问题；补丁与最新桌面/手机源码重新同步。
+- **验证（麒麟 V11 实机 + Android 模拟器）**：WIP 源码后端在麒麟 VM 通过 145 项手机 API 验收（配对、一次性 token、会话撤销、轮换、受控过期、文件往返、owner 隔离）；Android API 35 模拟器完成真实浏览器配对、重新配对与无 token 失败路径。
+
 ### 2026-09-06 - PR #215 安全隔离、远程会话与发布验证
 
 - **Security · 身份与 owner 隔离**：保留配置 owner 的注册门槛，统一 key hash 唯一约束和轮换碰撞保护；agent/team/run、provider/gateway、workflow/audit 与移动文件按 owner 隔离。浮动会话在关联运行清理后仍校验自身 owner，后台及定时工作流审计归属持久化执行主体。

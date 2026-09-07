@@ -137,7 +137,7 @@ sudo rpm -i release/wanwei-shuyi-desktop-1.0.0.x86_64.rpm
 ### 4.4 首次启动
 
 首次启动会：
-1. 在 `~/.config/wanwei-shuyi-desktop/venv/` 创建 Python 虚拟环境；依赖哈希变化或关键原生扩展导入失败时自动重建，避免复用不可执行的旧环境；
+1. 在 `~/.config/wanwei-shuyi-desktop/venv/` 创建 Python 虚拟环境；依赖哈希变化或普通损坏时自动重建。若失败原因疑似系统执行策略（如麒麟 KySec）拦截原生扩展，则保留已安装环境和待激活候选，给出逐文件授权指引，授权后重启直接复检，不重复联网安装；
 2. 安装后端依赖（`pip install -r backend/requirements.txt`）；
 3. 生成 48 位本地 API Key；
 4. 启动后端并加载 Web 控制台窗口。
