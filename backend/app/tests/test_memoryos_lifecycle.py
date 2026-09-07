@@ -8,6 +8,8 @@
 5. 每次转移写入账本
 """
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from backend.app.memoryos import lifecycle as lc
@@ -410,8 +412,12 @@ def test_scan_stale_idle_scan_disabled_by_default(isolated_db):
     assert result["idle_scan_enabled"] is False
     assert result["marked_count"] == 0
 
-    # 显式开启后才按闲置判定（阈值 0 天 = 全部视为闲置）
-    opted_in = lc.scan_stale(idle_days=0.0000001)
+    # 显式开启后才按闲置判定。参考时间推到一天后，阈值等效于「全部视为闲置」；
+    # 不依赖写库到扫描的真实耗时——毫秒级阈值在快机器上会形成时序竞争（CI 红）。
+    opted_in = lc.scan_stale(
+        idle_days=0.0000001,
+        reference_time=datetime.now(timezone.utc) + timedelta(days=1),
+    )
     assert opted_in["idle_scan_enabled"] is True
     assert opted_in["marked_count"] >= 1
 
