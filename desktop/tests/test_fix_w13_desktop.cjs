@@ -15,12 +15,14 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const Module = require('node:module');
+const childProcess = require('node:child_process');
 const SRC_DIR = path.join(__dirname, '..', 'src');
 const { recoverBackendEnvBackup, swapBackendEnv } = require('../src/backend_env');
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wanwei-w13-'));
 
 let exposedApi = null;
+let spawnSyncOverride = null;
 const browserWindows = [];
 
 class BrowserWindowStub extends EventEmitter {
@@ -91,6 +93,10 @@ const electronStub = {
 const origLoad = Module._load;
 Module._load = function (request, ...rest) {
   if (request === 'electron') return electronStub;
+  if (request === 'node:child_process') {
+    return { ...childProcess, spawnSync: (...args) =>
+      (spawnSyncOverride || childProcess.spawnSync)(...args) };
+  }
   return origLoad.call(this, request, ...rest);
 };
 
@@ -116,6 +122,58 @@ async function t(name, fn) {
   } catch (err) {
     results.push(['FAIL', `${name} :: ${err && err.message}`]);
   }
+}
+
+const testVenv = path.join(tmp, 'venv');
+const testStaging = `${testVenv}.staging`;
+const testRuntimeLog = path.join(tmp, 'runtime', 'backend.log');
+const testRequirementsHash = require('node:crypto').createHash('sha256')
+  .update(fs.readFileSync(path.join(__dirname, '..', '..', 'backend', 'requirements.txt')))
+  .digest('hex');
+
+function resetBackendEnvFixture() {
+  for (const directory of [testVenv, testStaging, `${testVenv}.previous`]) {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+  fs.mkdirSync(path.dirname(testRuntimeLog), { recursive: true });
+  fs.writeFileSync(testRuntimeLog, '');
+}
+
+function createBackendEnvFixture(directory, marker = '.deps-ok') {
+  const python = path.join(directory, 'bin', 'python3');
+  const nativeLibrary = path.join(directory, 'lib', 'python3.12', 'site-packages',
+    'pydantic_core', '_pydantic_core.cpython-312-x86_64-linux-gnu.so');
+  fs.mkdirSync(path.dirname(python), { recursive: true });
+  fs.mkdirSync(path.dirname(nativeLibrary), { recursive: true });
+  fs.writeFileSync(python, 'test interpreter');
+  fs.writeFileSync(nativeLibrary, 'test native library');
+  if (marker) fs.writeFileSync(path.join(directory, marker), testRequirementsHash);
+  return nativeLibrary;
+}
+
+function mockBackendEnvironmentCommands(probeResult) {
+  const calls = [];
+  spawnSyncOverride = (command, args, options) => {
+    if (args[0] === '-c') {
+      calls.push('probe');
+      return probeResult(command, args, options);
+    }
+    if (args[0] === '--version') {
+      calls.push('version');
+      return { status: 0 };
+    }
+    if (args[0] === '-m' && args[1] === 'venv') {
+      calls.push('create');
+      createBackendEnvFixture(args[2], null);
+      return { status: 0 };
+    }
+    if (args[0] === 'install') {
+      calls.push('pip');
+      return { status: 0 };
+    }
+    throw new Error(`Unexpected subprocess: ${command}`);
+  };
+  return calls;
 }
 
 (async () => {
@@ -313,8 +371,8 @@ async function t(name, fn) {
       '探针应确认 uvicorn 已真实绑定 loopback 端口');
     assert.ok(src.includes('"--lifespan", "off"'),
       '探针不得在预检阶段触碰用户数据库生命周期');
-    assert.ok(src.includes('.staging-${process.pid}-${Date.now()}'),
-      '重建应先写入独立 staging venv');
+    assert.ok(src.includes('`${VENV_DIR}.staging`'),
+      '重建应写入独立且可跨重启复检的 staging venv');
     assert.ok(src.includes('await swapBackendEnv(VENV_DIR, stagingDir, logLine)'),
       '新环境通过健康检查后才应替换当前 venv');
     assert.ok(src.includes('await recoverBackendEnvBackup(VENV_DIR, logLine)'),
@@ -358,6 +416,151 @@ async function t(name, fn) {
     assert.strictEqual(fs.existsSync(`${recoveryVenv}.previous`), false);
   });
 
+  await t('运行时探针保留诊断且不会把普通原生库导入错误判为执行限制', () => {
+    const scenarios = [
+      { stderr: 'ImportError: /venv/lib/python3.12/site-packages/native.so: failed to map segment from shared object', blocked: true },
+      { stderr: 'ImportError: /venv/lib/python3.12/site-packages/native.so: undefined symbol: missing_symbol', blocked: false },
+      { stderr: 'ImportError: /venv/lib/python3.12/site-packages/native.so: invalid ELF header', blocked: false },
+      { stderr: 'ModuleNotFoundError: No module named uvicorn', blocked: false },
+      { stderr: '', error: Object.assign(new Error('spawn EACCES'), { code: 'EACCES' }), blocked: true },
+    ];
+    try {
+      for (const scenario of scenarios) {
+        spawnSyncOverride = () => ({ status: 1, signal: null, stdout: 'probe context', ...scenario });
+        const result = main.probeBackendEnv('test-python');
+        assert.strictEqual(result.healthy, false);
+        assert.strictEqual(result.possibleExecutionRestriction, scenario.blocked, scenario.stderr);
+        assert.strictEqual(result.stderr, scenario.stderr);
+        assert.strictEqual(result.stdout, 'probe context');
+        assert.strictEqual(result.status, 1);
+        if (scenario.error) assert.match(result.error, /EACCES/);
+      }
+    } finally {
+      spawnSyncOverride = null;
+    }
+  });
+
+  await t('缓存执行限制保留已安装依赖和 marker，不创建环境或重新 pip', async () => {
+    resetBackendEnvFixture();
+    const nativeLibrary = createBackendEnvFixture(testVenv);
+    const originalError = `ImportError: ${nativeLibrary}: failed to map segment from shared object`;
+    const calls = mockBackendEnvironmentCommands(() => ({ status: 1, stderr: originalError }));
+    const notifications = [];
+    try {
+      await assert.rejects(main.ensureBackendEnv((...args) => notifications.push(args)),
+        (error) => error.code === 'BACKEND_EXECUTION_RESTRICTED');
+      assert.deepStrictEqual(calls, ['probe'], '策略失败不得重新创建 venv、查找系统 Python 或调用 pip');
+      assert.deepStrictEqual(notifications, []);
+      assert.strictEqual(fs.readFileSync(path.join(testVenv, '.deps-ok'), 'utf8'), testRequirementsHash);
+      assert.strictEqual(fs.readFileSync(nativeLibrary, 'utf8'), 'test native library');
+      assert.strictEqual(fs.existsSync(testStaging), false);
+      const log = fs.readFileSync(testRuntimeLog, 'utf8');
+      assert.ok(log.includes(originalError), '原始 loader 错误应进入日志');
+      assert.match(log, /status=1/);
+    } finally {
+      spawnSyncOverride = null;
+    }
+  });
+
+  await t('普通缓存损坏仍会重建，同时保留原始失败证据', async () => {
+    resetBackendEnvFixture();
+    const nativeLibrary = createBackendEnvFixture(testVenv);
+    const originalError = `ImportError: ${nativeLibrary}: undefined symbol: missing_symbol`;
+    const calls = mockBackendEnvironmentCommands((python) => python === path.join(testVenv, 'bin', 'python3')
+      ? { status: 1, stderr: originalError }
+      : { status: 0, stderr: '' });
+    try {
+      assert.strictEqual(await main.ensureBackendEnv(() => {}), path.join(testVenv, 'bin', 'python3'));
+      assert.strictEqual(calls.filter((call) => call === 'create').length, 1);
+      assert.strictEqual(calls.filter((call) => call === 'pip').length, 1);
+      assert.strictEqual(fs.readFileSync(path.join(testVenv, '.deps-ok'), 'utf8'), testRequirementsHash);
+      assert.strictEqual(fs.existsSync(testStaging), false);
+      assert.ok(fs.readFileSync(testRuntimeLog, 'utf8').includes(originalError));
+    } finally {
+      spawnSyncOverride = null;
+    }
+  });
+
+  await t('新安装依赖被执行策略拒绝时可原地复检，修复后才原子激活', async () => {
+    try {
+      for (const hasPreviousEnv of [false, true]) {
+        resetBackendEnvFixture();
+        if (hasPreviousEnv) {
+          createBackendEnvFixture(testVenv);
+          fs.writeFileSync(path.join(testVenv, '.deps-ok'), 'old-requirements');
+          fs.writeFileSync(path.join(testVenv, 'state'), 'last-known-good');
+        }
+        const calls = mockBackendEnvironmentCommands((python) => ({
+          status: 1,
+          stderr: `ImportError: ${path.join(path.dirname(path.dirname(python)), 'lib', 'python3.12',
+            'site-packages', 'pydantic_core', '_pydantic_core.cpython-312-x86_64-linux-gnu.so')}: failed to map segment from shared object`,
+        }));
+        await assert.rejects(main.ensureBackendEnv(() => {}),
+          (error) => error.code === 'BACKEND_EXECUTION_RESTRICTED');
+        assert.strictEqual(calls.filter((call) => call === 'pip').length, 1);
+        assert.strictEqual(fs.readFileSync(path.join(testStaging, '.deps-installed'), 'utf8'), testRequirementsHash);
+        assert.strictEqual(fs.existsSync(path.join(testStaging, '.deps-ok')), false,
+          '未通过运行时检查的候选环境不得标为健康');
+
+        calls.length = 0;
+        await assert.rejects(main.ensureBackendEnv(() => {}),
+          (error) => error.code === 'BACKEND_EXECUTION_RESTRICTED');
+        assert.deepStrictEqual(calls, ['probe'], '策略未修复时再次启动只复检原候选目录');
+        if (hasPreviousEnv) {
+          assert.strictEqual(fs.readFileSync(path.join(testVenv, 'state'), 'utf8'), 'last-known-good');
+          assert.strictEqual(fs.readFileSync(path.join(testVenv, '.deps-ok'), 'utf8'), 'old-requirements');
+        } else {
+          assert.strictEqual(fs.existsSync(testVenv), false);
+        }
+
+        const recoveredCalls = mockBackendEnvironmentCommands(() => ({ status: 0 }));
+        assert.strictEqual(await main.ensureBackendEnv(() => {}), path.join(testVenv, 'bin', 'python3'));
+        assert.deepStrictEqual(recoveredCalls, ['probe'], '策略修复后复用已安装依赖，不再下载');
+        assert.strictEqual(fs.readFileSync(path.join(testVenv, '.deps-ok'), 'utf8'), testRequirementsHash);
+        assert.strictEqual(fs.existsSync(testStaging), false);
+        assert.strictEqual(fs.existsSync(`${testVenv}.previous`), false);
+      }
+    } finally {
+      spawnSyncOverride = null;
+    }
+  });
+
+  await t('新候选环境的普通预检失败只清理候选目录', async () => {
+    resetBackendEnvFixture();
+    createBackendEnvFixture(testVenv);
+    fs.writeFileSync(path.join(testVenv, '.deps-ok'), 'old-requirements');
+    const originalError = 'ModuleNotFoundError: No module named uvicorn';
+    mockBackendEnvironmentCommands(() => ({ status: 1, stderr: originalError }));
+    try {
+      await assert.rejects(main.ensureBackendEnv(() => {}), /运行时预检失败/);
+      assert.strictEqual(fs.existsSync(testStaging), false);
+      assert.strictEqual(fs.readFileSync(path.join(testVenv, '.deps-ok'), 'utf8'), 'old-requirements');
+      assert.ok(fs.readFileSync(testRuntimeLog, 'utf8').includes(originalError));
+    } finally {
+      spawnSyncOverride = null;
+    }
+  });
+
+  await t('执行限制恢复指引仅针对实际依赖文件并正确引用路径', () => {
+    const quotedRoot = fs.mkdtempSync(path.join(tmp, "venv space' $()-"));
+    const nativeLibrary = createBackendEnvFixture(quotedRoot);
+    const diagnostics = { stderr: `ImportError: ${nativeLibrary}: failed to map segment from shared object` };
+    const hint = main.backendExecutionRemedyHint(quotedRoot, diagnostics);
+    const quotedLibrary = "'" + nativeLibrary.replace(/'/g, "'\\''") + "'";
+    assert.ok(hint.includes(`kyexectl -g ${quotedLibrary}`));
+    assert.ok(hint.includes(`sudo kyexectl -s -o ${quotedLibrary}`));
+    assert.ok(!hint.includes(' -r '), '不得递归信任用户数据或依赖目录');
+    assert.ok(!hint.includes('使用说明书 6.1'), '不得引用不存在的操作说明');
+    assert.match(hint, /确认.*KySec/, '该错误不是 KySec 的充分证据');
+
+    const externalLibrary = path.join(tmp, 'platform', 'uploads', 'payload.so');
+    const externalHint = main.backendExecutionRemedyHint(quotedRoot, {
+      stderr: `ImportError: ${externalLibrary}: failed to map segment from shared object`,
+    });
+    assert.ok(!externalHint.includes(externalLibrary));
+    assert.ok(!externalHint.includes('sudo kyexectl'), '环境依赖目录外的路径不得生成信任命令');
+  });
+
   await t('10-#13 maintainer 非占位邮箱', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
     assert.ok(!/example\.(cn|com|org|net)/.test(pkg.build.linux.maintainer),
@@ -376,6 +579,119 @@ async function t(name, fn) {
     assert.strictEqual(Buffer.from(bin.content, 'base64')[4], 0x00);
     const lossy = main.decodeFileBuffer(Buffer.from([0xFF, 0xFE, 0x41]));
     assert.strictEqual(lossy.encoding, 'utf8-lossy', '非法 UTF-8 应回退并标注');
+  });
+
+  await t('冷启动清理陈旧 LAN 状态且失败时不创建窗口', () => {
+    const src = fs.readFileSync(path.join(SRC_DIR, 'main.js'), 'utf8');
+    assert.ok(src.includes("method: 'POST'"), '冷启动清理必须使用 POST');
+    assert.ok(src.includes("/platform/system/lan/disable"), '应调用 LAN disable 接口');
+    assert.ok(src.includes("req.setHeader('X-API-Key', apiKey)"), '请求必须认证');
+    assert.ok(src.includes('setTimeout(fail, 5000)'), '请求必须有超时上限');
+    assert.ok(src.includes("data.enabled !== false") && src.includes("data.bind !== '127.0.0.1'"),
+      '必须确认响应已关闭 LAN 并绑定 loopback');
+    assert.ok(src.includes('data.token_set !== false') && src.includes('data.revoked_sessions'),
+      '必须确认旧会话已撤销');
+    const boot = src.indexOf('await startBackend(py);');
+    const reconcile = src.indexOf('await reconcileLanState();', boot);
+    const window = src.indexOf('createWindow();', reconcile);
+    assert.ok(boot >= 0 && reconcile > boot && window > reconcile,
+      '冷启动应在后端启动后、创建窗口前完成清理');
+    assert.match(src, /logLine\('boot failed: ' \+ err.message\);\r?\n      await stopBackend\(\);/,
+      '清理失败必须停止后端并走启动失败路径');
+    assert.strictEqual((src.match(/await reconcileLanState\(\);/g) || []).length, 1,
+      '不得在 LAN toggle restart 路径重复清理');
+  });
+
+  await t('Cold-start LAN reconciliation validates responses and bounds failures', async () => {
+    const vm = require('node:vm');
+    const src = fs.readFileSync(path.join(SRC_DIR, 'main.js'), 'utf8');
+    const helper = src.slice(src.indexOf('function reconcileLanState()'), src.indexOf('function stopBackend()'));
+    const disabled = { enabled: false, bind: '127.0.0.1', token_set: false, revoked_sessions: 2 };
+    for (const scenario of ['success', 'status', 'redirect', 'json', 'null', 'enabled', 'bind',
+      'token', 'revocation', 'oversize', 'request-error', 'response-error', 'aborted', 'timeout', 'setup-error']) {
+      let timeout;
+      let cleared = false;
+      let aborted = false;
+      const req = new EventEmitter();
+      const res = new EventEmitter();
+      const headers = {};
+      req.setHeader = (name, value) => { headers[name] = value; };
+      req.abort = () => { aborted = true; req.emit('abort'); };
+      req.end = () => {
+        if (scenario === 'timeout') return;
+        if (scenario === 'request-error') { req.emit('error', new Error(TEST_API_KEY)); return; }
+        res.statusCode = scenario === 'status' ? 401 : scenario === 'redirect' ? 302 : 200;
+        req.emit('response', res);
+        if (scenario === 'response-error') { res.emit('error', new Error(TEST_API_KEY)); return; }
+        if (scenario === 'aborted') { res.emit('aborted'); return; }
+        const data = { ...disabled };
+        if (scenario === 'enabled') data.enabled = true;
+        if (scenario === 'bind') data.bind = '0.0.0.0';
+        if (scenario === 'token') data.token_set = true;
+        if (scenario === 'revocation') delete data.revoked_sessions;
+        const body = scenario === 'json' ? TEST_API_KEY : scenario === 'null' ? 'null'
+          : scenario === 'oversize' ? ' '.repeat(8193) : JSON.stringify(data);
+        res.emit('data', Buffer.from(body.slice(0, 7)));
+        res.emit('data', Buffer.from(body.slice(7)));
+        res.emit('end');
+      };
+      const context = vm.createContext({
+        Buffer, backendPort: 8123, apiKey: TEST_API_KEY,
+        net: { request: (options) => {
+          assert.strictEqual(options.method, 'POST');
+          assert.strictEqual(options.url, 'http://127.0.0.1:8123/platform/system/lan/disable');
+          assert.strictEqual(options.redirect, 'error');
+          if (scenario === 'setup-error') throw new Error(TEST_API_KEY);
+          return req;
+        } },
+        setTimeout: (fn, ms) => { assert.strictEqual(ms, 5000); timeout = fn; return 1; },
+        clearTimeout: (id) => { assert.strictEqual(id, 1); cleared = true; },
+      });
+      const pending = vm.runInContext(`${helper}\nreconcileLanState()`, context);
+      if (scenario === 'timeout') timeout();
+      if (scenario === 'success') {
+        await pending;
+        assert.strictEqual(aborted, false);
+      } else {
+        await assert.rejects(pending, (err) => err.message === 'Cold-start LAN reconciliation failed', scenario);
+        assert.strictEqual(aborted, scenario !== 'setup-error', scenario);
+      }
+      if (scenario !== 'setup-error') assert.strictEqual(headers['X-API-Key'], TEST_API_KEY);
+      assert.strictEqual(cleared, true, scenario);
+    }
+  });
+
+  await t('Cold-start UI waits for reconciliation and stays closed on failure', async () => {
+    const vm = require('node:vm');
+    const src = fs.readFileSync(path.join(SRC_DIR, 'main.js'), 'utf8');
+    const boot = src.slice(src.indexOf('    try {', src.indexOf('app.whenReady()')),
+      src.indexOf('\n  });', src.indexOf('app.whenReady()')));
+    for (const succeeds of [true, false]) {
+      const calls = [];
+      let settle;
+      const pending = new Promise((resolve, reject) => {
+        settle = () => succeeds ? resolve() : reject(new Error('reconciliation failed'));
+      });
+      const context = vm.createContext({
+        APP_NAME: 'test', backendPort: 8123, backendPython: '',
+        ensureBackendEnv: async () => 'python',
+        startBackend: async (...args) => { assert.deepStrictEqual(args, ['python']); calls.push('start'); },
+        reconcileLanState: () => { calls.push('reconcile'); return pending; },
+        stopBackend: async () => { calls.push('stop'); },
+        logLine: () => {}, dialog: { showErrorBox: () => calls.push('error') },
+        app: { exit: (code) => { assert.strictEqual(code, 1); calls.push('exit'); } },
+        createWindow: () => calls.push('window'), createTray: () => calls.push('tray'),
+        notify: () => calls.push('notify'),
+      });
+      const running = vm.runInContext(`(async () => { ${boot} })()`, context);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepStrictEqual(calls, ['start', 'reconcile']);
+      settle();
+      await running;
+      assert.deepStrictEqual(calls, succeeds
+        ? ['start', 'reconcile', 'window', 'tray', 'notify']
+        : ['start', 'reconcile', 'stop', 'error', 'exit']);
+    }
   });
 
   let failed = 0;

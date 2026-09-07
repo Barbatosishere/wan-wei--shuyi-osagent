@@ -4,6 +4,27 @@
 
 ## Unreleased
 
+### 2026-09-07 - PR #215 麒麟实机与手机端复验修复
+
+- **Security · 审计读取 fail-closed**：请求身份不可用或为空时审计查询返回空结果，不再退化为读取全部审计记录；空 owner 无法选中未认领的旧记录。JSON1 不可用的 LIKE 兼容查询同样保持 owner 作用域。
+- **Fixed · 手机重配对**：携带新配对 token 的链接优先于本地缓存的旧会话；页面复用（仅 hash 变化）时也会先中止并清理旧会话再兑换新 token，修复旧 session 已被撤销后页面停留在失效状态的问题。
+- **Fixed · 桌面依赖环境与执行策略**：运行时预检保留完整诊断并区分「疑似执行策略拦截」（如 KySec、noexec、EACCES/EPERM）与普通损坏：前者保留已安装环境和待激活候选、提示逐文件授权（`kyexectl -g`/`-s -o`），授权后重启原地复检，不再死循环重建；后者照旧自动重建。staging 目录改为稳定路径并拆分 `.deps-installed`/`.deps-ok` 标记，未通过运行时检查的候选不会被标记为健康。探针失败日志脱敏后再落盘。
+- **Fixed · 发布清理补丁可移植性**：发布 staging 测试携带 `.gitattributes` 并按 `core.autocrlf` 两种取值参数化，修复无属性配置且 autocrlf=false 的主机上补丁无法应用的问题；补丁与最新桌面/手机源码重新同步。
+- **Security · 二次审查修复（Kilo/CodeQL 复审 434dd42）**：LAN 会话校验的独立 SQLite 连接补回数据库文件身份检查（替换/删除后 fail-closed，不再从失效库应答）；移动文件列表/下载的旧归属认领从逐行共享连接 commit 改为单次受保护写事务（GET 不再持有提交副作用）；配额查询改为字符串拼接而非 f-string 内插子句；桌面端 KySec 提示的正则按单行匹配并限制路径长度（消除多项式回溯风险）；手机端会话凭证改为仅内存保存，不再写入浏览器存储。
+- **Fixed · CI 去抖**：`test_scan_stale_idle_scan_disabled_by_default` 改用显式未来参考时间判定闲置，不再依赖写库到扫描的真实耗时（毫秒级阈值在快速 CI 机器上形成时序竞争）。
+- **验证（麒麟 V11 实机 + Android 模拟器）**：WIP 源码后端在麒麟 VM 通过 145 项手机 API 验收（配对、一次性 token、会话撤销、轮换、受控过期、文件往返、owner 隔离）；Android API 35 模拟器完成真实浏览器配对、重新配对与无 token 失败路径。
+
+### 2026-09-06 - PR #215 安全隔离、远程会话与发布验证
+
+- **Security · 身份与 owner 隔离**：保留配置 owner 的注册门槛，统一 key hash 唯一约束和轮换碰撞保护；agent/team/run、provider/gateway、workflow/audit 与移动文件按 owner 隔离。浮动会话在关联运行清理后仍校验自身 owner，后台及定时工作流审计归属持久化执行主体。
+- **Security · 凭证事务**：身份与 LAN 凭证写入使用独立事务并检查数据库文件身份，不提交业务调用方事务；撤销目标不属于当前身份时不区分其注册或活跃状态。身份完全停用后，关联 LAN 会话也失效；数据库访问失败不再被当作撤销成功。
+- **Security · 远程连接**：LAN 配对使用一次性 token 与独立短期 session credential，不下发桌面主 API key；MCP SSE 初始地址与 endpoint 分别执行 SSRF 校验并绑定 IP、Host 与 SNI。
+- **Fixed · 会话与文件**：手机解除配对、过期和重新配对会中止旧请求并清理状态，旧响应与结束回调不会影响新会话；上传失败或取消时清理未登记文件，配额检查与登记使用同一事务。删除 Provider 配置同时移除当前 owner 的旧兼容副本，避免旧凭据重新生效。
+- **Fixed · 身份 API**：非法 key 字段返回 422，轮换 key 冲突返回 409，并保持原身份和凭证状态不变。
+- **Fixed · LAN Origin**：来源校验使用后端实际监听端口，命令行 `--port` 优先于环境变量，避免自定义端口下的合法请求被拒绝。
+- **Changed · 发布链**：发布清理补丁与最终移动源码同步，只作用于 staging；保留 Electron 冷启动 LAN 撤销、绑定核对及 owner 校验的关闭接口。新增发布树行为回归，核对清理范围和共享认证模块。
+- **Documentation**：补充身份、LAN、迁移及回滚说明；修正前端 Node 要求、未配置模型时的行为、桌面安装包示例和 Windows 构建目录命令。
+
 ### 2026-09-05 - 安全修复：identity 注册门槛 + DB 身份指纹（#211 / #213）
 - **#211 identity 注册门槛**：`actor_id_from_api_key` 自动注册**仅限配置的 owner key**（环境变量/密钥文件来源）——此前任何首次见到的 key（含回环免密 GET 携带的任意值）都会静默落库成永久凭据，绕过 rotate/revoke；陌生 key 改为派生稳定 ID（作用域隔离，看到自己的空 scope）**不落库**，owner key 首次使用照常完成身份引导（个人单 key 使用零变化）；轮换测试按新语义更新（原 4 条测试锁定的正是漏洞行为）。
 - **#211 回环误判修复**：`_is_loopback_bound` 实际绑定地址取进程参数 `--host` 优先于 `WANWEI_HOST` 环境声明——`uvicorn --host 0.0.0.0` 启动而 env 未设时不再误判回环（回环免密静默对外生效）；`_loopback_origin_allowlist` 端口同理取 `--port` 优先（与实际监听一致，同源写不再被 403）。

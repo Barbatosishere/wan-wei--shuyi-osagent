@@ -48,13 +48,14 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from functools import lru_cache
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from ..audit.service import audit_owner_context
 from ..memory_runtime.policy_gate import evaluate_policy
 from . import _system_svc_runtime as _sysrt
 from .deps import WORK_GEARS
@@ -380,7 +381,7 @@ def _store_new_flow(flow_id: str, flow: dict) -> None:
 def _normalize_flow(
     pf: dict,
     fid: str,
-    existing: Optional[dict],
+    existing: dict | None,
     *,
     preserve_existing_steps: bool = False,
 ) -> dict:
@@ -513,7 +514,7 @@ def _parsed_cron(
     return minute_offsets, doms, months, parts[2] in ('*', '?'), parts[4] in ('*', '?'), dows
 
 
-def _next_cron_dt(cron: Optional[str], now: Optional[datetime] = None) -> tuple[Optional[datetime], bool]:
+def _next_cron_dt(cron: str | None, now: datetime | None = None) -> tuple[datetime | None, bool]:
     """返回 (下次触发的本地 aware datetime, approximate)。
 
     显式本地时区（datetime.now().astimezone() 的固定偏移），与全模块
@@ -556,7 +557,7 @@ def _next_cron_dt(cron: Optional[str], now: Optional[datetime] = None) -> tuple[
     return None, True
 
 
-def _next_cron_run(cron: Optional[str], now: Optional[datetime] = None) -> tuple[Optional[str], bool]:
+def _next_cron_run(cron: str | None, now: datetime | None = None) -> tuple[str | None, bool]:
     """返回 (下次触发本地时间 ISO8601 带时区偏移, approximate)。"""
     nxt, approximate = _next_cron_dt(cron, now)
     return (nxt.isoformat(timespec='seconds') if nxt is not None else None), approximate
@@ -616,7 +617,7 @@ def _extract_time(text: str) -> tuple[int, int, bool]:
     return hour, minute, True
 
 
-def _parse_trigger(text: str) -> tuple[str, Optional[str], str]:
+def _parse_trigger(text: str) -> tuple[str, str | None, str]:
     """识别触发方式，返回 (trigger, cron, 中文说明)。"""
     hour, minute, has_time = _extract_time(text)
     m = re.search(r'每\s*(\d+)\s*分钟', text)
@@ -654,7 +655,7 @@ def _parse_trigger(text: str) -> tuple[str, Optional[str], str]:
     return 'manual', None, '手动触发'
 
 
-def _extract_name(text: str) -> Optional[str]:
+def _extract_name(text: str) -> str | None:
     m = re.search(r'(?:改名为|命名为|名为|叫做|名称是?|名字叫?)\s*[「\'"]?([^，。；;「」\'"]{2,20})', text)
     if m:
         return m.group(1).strip()
@@ -765,7 +766,7 @@ def _step_label(st: dict) -> str:
     return label
 
 
-def _ai_diff(base: Optional[dict], proposed: dict) -> list[str]:
+def _ai_diff(base: dict | None, proposed: dict) -> list[str]:
     changes: list[str] = []
     if base is None:
         changes.append(f'新建工作流「{proposed["name"]}」')
@@ -799,7 +800,7 @@ def _ai_diff(base: Optional[dict], proposed: dict) -> list[str]:
     return changes
 
 
-def _understood(base: Optional[dict], trigger: str, cron: Optional[str], steps: list[dict]) -> str:
+def _understood(base: dict | None, trigger: str, cron: str | None, steps: list[dict]) -> str:
     seq = ' → '.join(s['name'] for s in steps)
     t = TRIGGER_LABELS.get(trigger, trigger)
     if trigger == 'schedule' and cron:
@@ -912,7 +913,7 @@ async def _simulate_run(run_id: str, flow: dict) -> None:
     _persist_run(run_id, run)
 
 
-def _try_create_run(flow: dict, *, triggered_by: str, mode: str = 'dry_run', owner_id: Optional[str] = None) -> Optional[dict]:
+def _try_create_run(flow: dict, *, triggered_by: str, mode: str = 'dry_run', owner_id: str | None = None) -> dict | None:
     """创建 running 记录；同流程已有 running 时返回 None（重入拒绝）。
 
     重入检查与创建写入在同一 store 锁内完成，避免并发双开。
@@ -961,10 +962,16 @@ def _launch_run(run_id: str, flow: dict, mode: str = 'dry_run') -> None:
 
 
 async def _dispatch_run(run_id: str, flow: dict, mode: str) -> None:
-    if mode == 'real':
-        await _execute_run_real(run_id, flow)
-    else:
-        await _simulate_run(run_id, flow)
+    run = _runs.get(run_id)
+    if not isinstance(run, dict):
+        return
+    # Execution runs in its own thread, and scheduled jobs have no request
+    # context at all. Bind every nested audit write to the persisted owner.
+    with audit_owner_context(_run_owner(run)):
+        if mode == 'real':
+            await _execute_run_real(run_id, flow)
+        else:
+            await _simulate_run(run_id, flow)
 
 
 # ---------------------------------------------------------------------------
@@ -1161,7 +1168,7 @@ def _memory_content_text(cap: dict) -> str:
     return str(content or '')
 
 
-def _fill_memory_result(st: dict, cfg: dict) -> None:
+def _fill_memory_result(st: dict, cfg: dict, owner_id: str) -> None:
     """通过 memory_runtime 真实读写记忆胶囊。
 
     写入前先过 policy_gate.evaluate_policy：reject/quarantine → 步骤失败
@@ -1215,6 +1222,7 @@ def _fill_memory_result(st: dict, cfg: dict) -> None:
                 'verified': False,
                 'verification_method': 'unknown',
             },
+            owner_id=owner_id,
         )
         governance = res.get('governance') or {}
         state = res.get('state') or {}
@@ -1238,7 +1246,7 @@ def _fill_memory_result(st: dict, cfg: dict) -> None:
             st['status'] = 'failed'
             st['detail'] = 'memory.read 需要在 config.key 提供胶囊 id（cap_…）；留空不支持'
             return
-        cap = capsule_store.get_capsule(key)
+        cap = capsule_store.get_capsule(key, owner_id=owner_id)
         if cap is None:
             st['status'] = 'failed'
             st['detail'] = f'记忆不存在或当前作用域不可读：{key}'
@@ -1320,12 +1328,14 @@ def _fill_condition_result(st: dict, cfg: dict) -> None:
     )
 
 
-async def _agent_complete(task: str) -> tuple[str, str]:
+async def _agent_complete(
+    task: str, owner_id: str | None = None,
+) -> tuple[str, str]:
     """调用模型网关真实补全（复用 agents._try_gateway 回退链，含
     get_active_provider 兜底）。网关不可用/未配置/调用失败 → 抛
     RuntimeError 由步骤统一标 failed，绝不回退假文本。"""
     from .agents import _try_gateway  # noqa: SLF001 —— 复用既有回退链
-    text, provider_used = await _try_gateway(task[:800])
+    text, provider_used = await _try_gateway(task[:800], owner_id=owner_id)
     if not text:
         raise RuntimeError(
             '模型网关不可用（未配置可用 provider 或本次调用失败），agent 步骤不回退模拟文本'
@@ -1333,7 +1343,9 @@ async def _agent_complete(task: str) -> tuple[str, str]:
     return text, (provider_used or 'unknown')
 
 
-async def _exec_step_real(step: dict, index: int, gear: Optional[str]) -> dict:
+async def _exec_step_real(
+    step: dict, index: int, gear: str | None, owner_id: str,
+) -> dict:
     """单个步骤的真实执行器。门禁前置（PermissionError → failed）；
     其余任何异常都终结为 failed + 原因，绝不静默成功。"""
     stype = step.get('type') if step.get('type') in STEP_TYPES else 'agent'
@@ -1355,13 +1367,13 @@ async def _exec_step_real(step: dict, index: int, gear: Optional[str]) -> dict:
         elif stype == 'http':
             await asyncio.to_thread(_fill_http_result, st, cfg)
         elif stype == 'memory':
-            await asyncio.to_thread(_fill_memory_result, st, cfg)
+            await asyncio.to_thread(_fill_memory_result, st, cfg, owner_id)
         elif stype == 'condition':
             _fill_condition_result(st, cfg)
         else:  # agent
             task = str(cfg.get('task') or cfg.get('prompt') or st['name'])
             st['would_run'] = task
-            text, provider_used = await _agent_complete(task)
+            text, provider_used = await _agent_complete(task, owner_id=owner_id)
             st['output'] = text
             st['provider'] = provider_used
             st['detail'] = f'真实调用模型网关完成（provider={provider_used}）'
@@ -1383,14 +1395,15 @@ async def _execute_run_real(run_id: str, flow: dict) -> None:
     if run is None:
         return
     fid = str(flow.get('id') or '')
+    owner_id = str(run.get('owner_id') or configured_actor_id())
     gear = flow.get('gear')
     steps = flow.get('steps') or []
     results: list[dict] = []
     status = 'done'
-    stopped_at: Optional[int] = None
+    stopped_at: int | None = None
     try:
         for i, step in enumerate(steps):
-            st = await _exec_step_real(step, i, gear)
+            st = await _exec_step_real(step, i, gear, owner_id)
             st['finished_at'] = _now_iso()
             results.append(st)
             run['step_results'] = results
@@ -1452,7 +1465,7 @@ def _scheduler_interval() -> float:
         return _DEFAULT_SCHEDULER_INTERVAL
 
 
-def _scheduler_tick(now: Optional[datetime] = None) -> list[str]:
+def _scheduler_tick(now: datetime | None = None) -> list[str]:
     """扫一遍 enabled 的定时流程，到期即触发一次模拟运行。
 
     返回本轮触发的 run id 列表。同流程已有 running 时跳过本次触发
@@ -1485,13 +1498,14 @@ def _scheduler_tick(now: Optional[datetime] = None) -> list[str]:
         owner = _flow_owner(flow)
         if owner and not flow.get('owner_id'):
             _materialize_owner(_flows, str(fid), flow, owner)
-        run = _try_create_run(flow, triggered_by='schedule', mode=mode, owner_id=owner)
-        if run is not None:
-            _launch_run(run['id'], flow, mode)
-            fired.append(run['id'])
-            audit_safe('flow_run_started', {'run_id': run['id'], 'flow_id': fid, 'manual': False, 'mode': mode})
-        else:
-            audit_safe('flow_run_skipped', {'flow_id': fid, 'reason': '已有运行进行中，跳过本次定时触发'})
+        with audit_owner_context(owner):
+            run = _try_create_run(flow, triggered_by='schedule', mode=mode, owner_id=owner)
+            if run is not None:
+                _launch_run(run['id'], flow, mode)
+                fired.append(run['id'])
+                audit_safe('flow_run_started', {'run_id': run['id'], 'flow_id': fid, 'manual': False, 'mode': mode})
+            else:
+                audit_safe('flow_run_skipped', {'flow_id': fid, 'reason': '已有运行进行中，跳过本次定时触发'})
         nxt, _approx = _next_cron_dt(flow['cron'], now)
         state['due'] = nxt
         state['updated_at'] = flow.get('updated_at')
@@ -1562,7 +1576,7 @@ def _flow_view(flow: dict) -> dict:
     语义），与 _run_view 的 mode 回填同口。"""
     view = _public_record(flow)
     view['gear'] = view.get('gear') if view.get('gear') in GEARS else 'human_review'
-    next_run: Optional[str] = None
+    next_run: str | None = None
     if view.get('trigger') == 'schedule' and view.get('enabled', True):
         next_run, _approx = _next_cron_run(view.get('cron'))
     view['next_run'] = next_run
@@ -1589,7 +1603,7 @@ def _run_view(run: dict) -> dict:
 # 路由 —— 固定路径先于参数路径
 # ---------------------------------------------------------------------------
 
-def _check_cron_value(v: Optional[str]) -> Optional[str]:
+def _check_cron_value(v: str | None) -> str | None:
     """cron 写入口统一校验：5 段格式 + 取值范围，非法抛 ValueError（pydantic 转 422）。"""
     if v is None:
         return None
@@ -1605,13 +1619,13 @@ class FlowIn(BaseModel):
     desc: str = Field(default='', max_length=MAX_FLOW_DESCRIPTION_LENGTH)
     trigger: Literal['manual', 'schedule', 'event'] = 'manual'
     gear: Gear = 'human_review'
-    cron: Optional[str] = Field(default=None, max_length=MAX_CRON_EXPRESSION_LENGTH)
+    cron: str | None = Field(default=None, max_length=MAX_CRON_EXPRESSION_LENGTH)
     steps: list[dict] = Field(default_factory=list, max_length=MAX_STEPS_PER_FLOW)
     enabled: bool = True
 
     @field_validator('cron')
     @classmethod
-    def _cron_valid(cls, v: Optional[str]) -> Optional[str]:
+    def _cron_valid(cls, v: str | None) -> str | None:
         return _check_cron_value(v)
 
     @field_validator('steps')
@@ -1621,27 +1635,27 @@ class FlowIn(BaseModel):
 
 
 class FlowPatch(BaseModel):
-    name: Optional[str] = Field(default=None, min_length=1, max_length=MAX_FLOW_NAME_LENGTH)
-    desc: Optional[str] = Field(default=None, max_length=MAX_FLOW_DESCRIPTION_LENGTH)
-    trigger: Optional[Literal['manual', 'schedule', 'event']] = None
-    gear: Optional[Gear] = None
-    cron: Optional[str] = Field(default=None, max_length=MAX_CRON_EXPRESSION_LENGTH)
-    steps: Optional[list[dict]] = Field(default=None, max_length=MAX_STEPS_PER_FLOW)
-    enabled: Optional[bool] = None
+    name: str | None = Field(default=None, min_length=1, max_length=MAX_FLOW_NAME_LENGTH)
+    desc: str | None = Field(default=None, max_length=MAX_FLOW_DESCRIPTION_LENGTH)
+    trigger: Literal['manual', 'schedule', 'event'] | None = None
+    gear: Gear | None = None
+    cron: str | None = Field(default=None, max_length=MAX_CRON_EXPRESSION_LENGTH)
+    steps: list[dict] | None = Field(default=None, max_length=MAX_STEPS_PER_FLOW)
+    enabled: bool | None = None
 
     @field_validator('cron')
     @classmethod
-    def _cron_valid(cls, v: Optional[str]) -> Optional[str]:
+    def _cron_valid(cls, v: str | None) -> str | None:
         return _check_cron_value(v)
 
     @field_validator('steps')
     @classmethod
-    def _steps_valid(cls, value: Optional[list[dict]]) -> Optional[list[dict]]:
+    def _steps_valid(cls, value: list[dict] | None) -> list[dict] | None:
         return _normalize_steps(value) if value is not None else None
 
 
 class AiEditIn(BaseModel):
-    flow_id: Optional[str] = None
+    flow_id: str | None = None
     instruction: str = Field(min_length=1, max_length=4000)
 
 
@@ -1680,7 +1694,7 @@ def ai_edit_flow(payload: AiEditIn, request: Request = None) -> dict:
     if not instruction:
         raise HTTPException(400, 'instruction 不能为空')
     owner_id = _actor_id(request)
-    base: Optional[dict] = None
+    base: dict | None = None
     if payload.flow_id:
         candidate = _flows.get(payload.flow_id)
         if isinstance(candidate, dict) and _record_visible(candidate, owner_id):
@@ -1784,7 +1798,7 @@ def update_flow(fid: str, payload: FlowPatch, request: Request = None) -> dict:
     return _flow_view(flow)
 
 
-def _delete_runs_of_flow(fid: str, owner_id: Optional[str] = None) -> int:
+def _delete_runs_of_flow(fid: str, owner_id: str | None = None) -> int:
     """级联清理某流程的运行记录（owner_id 传值时仅清理该属主的），返回清理条数。"""
     with _runs._lock:  # noqa: SLF001 —— 共享工具缺批量删除的务实兜底
         data = _runs._read()  # noqa: SLF001
@@ -1879,7 +1893,7 @@ async def simulate_flow(fid: str, request: Request = None) -> dict:
 
 
 @router.get('/runs')
-def list_runs(flow_id: Optional[str] = None, limit: int = 200, request: Request = None) -> list[dict]:
+def list_runs(flow_id: str | None = None, limit: int = 200, request: Request = None) -> list[dict]:
     limit = max(1, min(limit, 500))
     owner_id = _actor_id(request)
     items = []

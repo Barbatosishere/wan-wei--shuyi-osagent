@@ -219,34 +219,103 @@ const BACKEND_RUNTIME_PROBE_TIMEOUT_MS = 15_000;
  * requirements 哈希可能未变，但旧 wheel 的本地安全元数据已失效；只看 marker
  * 会让应用永久卡在启动失败循环。
  */
-function isBackendEnvHealthy(python, probe = BACKEND_RUNTIME_PROBE) {
+function probeBackendEnv(python, probe = BACKEND_RUNTIME_PROBE) {
   const result = spawnSync(python, ['-c', probe, BACKEND_DIR], {
     cwd: BACKEND_DIR,
     stdio: ['ignore', 'pipe', 'pipe'],
+    encoding: 'utf8',
     timeout: BACKEND_RUNTIME_PROBE_TIMEOUT_MS,
   });
-  return !result.error && result.status === 0;
+  const stderr = String(result.stderr || '');
+  return {
+    healthy: !result.error && result.status === 0,
+    status: result.status ?? null,
+    signal: result.signal ?? null,
+    error: result.error ? `${result.error.code || 'ERROR'}: ${result.error.message}` : null,
+    stdout: String(result.stdout || ''),
+    stderr,
+    // Loader mapping errors also occur with noexec mounts or access controls.
+    // They justify preserving the environment, but do not prove a KySec denial.
+    possibleExecutionRestriction: ['EACCES', 'EPERM'].includes(result.error?.code)
+      || /failed to map segment from shared object/i.test(stderr),
+  };
+}
+
+function isBackendEnvHealthy(python, probe = BACKEND_RUNTIME_PROBE) {
+  return probeBackendEnv(python, probe).healthy;
+}
+
+function logBackendProbeFailure(diagnostics) {
+  let details = [
+    `backend runtime preflight failed: status=${diagnostics.status}, signal=${diagnostics.signal || 'none'}`,
+    diagnostics.error, diagnostics.stdout, diagnostics.stderr,
+  ].filter(Boolean).join('\n');
+  for (const secret of [apiKey, process.env.WANWEI_API_KEY, process.env.WANWEI_ENCRYPTION_KEY]) {
+    if (secret) details = details.split(secret).join('[REDACTED]');
+  }
+  logLine(details);
+}
+
+function backendExecutionRemedyHint(environmentDir, diagnostics) {
+  const hint = '已保留依赖环境。请检查文件权限、noexec 挂载及安全策略；'
+    + '确认是 KySec 拒绝且依赖文件来源可信后，再授权对应文件。';
+  // Match within a single line and bound the path capture: an unbounded lazy
+  // class on multi-line loader output can backtrack quadratically (CodeQL).
+  const denialLine = String(diagnostics.stderr || '').split(/\r?\n/)
+    .find((entry) => /failed to map segment from shared object/i.test(entry));
+  const match = denialLine
+    ? denialLine.match(/ImportError:\s*([^\r\n]{1,512}?\.so):/i)
+    : null;
+  if (!match) return hint;
+
+  try {
+    const environment = fs.realpathSync(environmentDir);
+    const library = fs.realpathSync(match[1]);
+    const relative = path.relative(environment, library);
+    // Diagnostics are not authority to trust arbitrary files. Resolve symlinks
+    // and restrict any suggested command to this environment's installed wheels.
+    if (!relative || path.isAbsolute(relative) || relative === '..'
+        || relative.startsWith(`..${path.sep}`)
+        || !relative.split(path.sep).includes('site-packages')
+        || !fs.statSync(library).isFile()) return hint;
+    const quotedLibrary = "'" + library.replace(/'/g, "'\\''") + "'";
+    return `${hint} 查看标签：kyexectl -g ${quotedLibrary}；`
+      + `确认后执行：sudo kyexectl -s -o ${quotedLibrary}，然后重启应用。`;
+  } catch {
+    return hint;
+  }
+}
+
+function backendRuntimeError(environmentDir, diagnostics) {
+  logBackendProbeFailure(diagnostics);
+  const restricted = diagnostics.possibleExecutionRestriction;
+  const hint = restricted ? ' ' + backendExecutionRemedyHint(environmentDir, diagnostics) : '';
+  const error = new Error('后端依赖运行时预检失败，详见 ' + LOG_FILE + hint);
+  error.code = restricted ? 'BACKEND_EXECUTION_RESTRICTED' : 'BACKEND_PREFLIGHT_FAILED';
+  return error;
+}
+
+async function activateBackendEnv(stagingDir, reqHash) {
+  const diagnostics = probeBackendEnv(path.join(stagingDir, 'bin', 'python3'));
+  if (!diagnostics.healthy) throw backendRuntimeError(stagingDir, diagnostics);
+  await fsp.writeFile(path.join(stagingDir, '.deps-ok'), reqHash);
+  await swapBackendEnv(VENV_DIR, stagingDir, logLine);
+  return path.join(VENV_DIR, 'bin', 'python3');
+}
+
+async function discardFailedBackendCandidate(stagingDir, error) {
+  if (error.code === 'BACKEND_EXECUTION_RESTRICTED') return;
+  try {
+    await fsp.rm(stagingDir, { recursive: true, force: true });
+  } catch (cleanupError) {
+    logLine(`staging 后端环境清理失败：${cleanupError.message}`);
+  }
 }
 
 /**
- * 识别麒麟 KySec 执行控制对 venv 原生扩展的拦截（failed to map segment）。
- * 这种失败重建 venv 也治不好——是安全策略不是坏 wheel；必须提示用户打
- * 信任标签，否则探针失败 → 重建 → 再失败的死循环。
- */
-function looksLikeKysecDenial(logText) {
-  return /failed to map segment from shared object|ImportError.*\.so/i.test(String(logText || ''));
-}
-
-/** KySec 信任标签指引（麒麟 V11:对应用数据目录递归打 exectl 标签）。 */
-function kysecRemedyHint() {
-  return '检测到麒麟 KySec 拦截 venv 原生扩展加载。请在终端执行一次: '
-    + 'sudo kyexectl -s -r ' + USER_DATA + ' 后重启应用（详见使用说明书 6.1）。';
-}
-
-/**
- * 首次运行：创建 venv 并安装后端依赖（带桌面通知反馈）。.deps-ok marker 记录
- * requirements.txt 的 SHA-256；内容变化或运行时探针失败时完整重建，避免应用
- * 升级或麒麟安全元数据变化后继续复用损坏的原生扩展。
+ * .deps-ok identifies a validated environment; .deps-installed only proves pip
+ * finished for the current requirements. Preserve a blocked candidate so the
+ * same files can be authorized and rechecked without another network install.
  */
 async function ensureBackendEnv(notify) {
   await recoverBackendEnvBackup(VENV_DIR, logLine);
@@ -258,19 +327,31 @@ async function ensureBackendEnv(notify) {
   const cachedEnvMatchesRequirements =
     cachedEnvExists && fs.existsSync(marker) && depsMarkerMatches(marker, reqHash);
   if (cachedEnvMatchesRequirements) {
-    if (isBackendEnvHealthy(venvPy)) {
-      return venvPy;
-    }
+    const diagnostics = probeBackendEnv(venvPy);
+    if (diagnostics.healthy) return venvPy;
+    if (diagnostics.possibleExecutionRestriction) throw backendRuntimeError(VENV_DIR, diagnostics);
+    logBackendProbeFailure(diagnostics);
     logLine('cached venv runtime preflight failed; rebuilding environment ...');
   } else if (cachedEnvExists) {
     logLine('requirements.txt 哈希变化或 marker 失效，重建后端依赖 ...');
   }
 
+  // The desktop holds its single-instance lock before reaching this function.
+  // A stable path allows a candidate blocked by system policy to survive restart.
+  const stagingDir = `${VENV_DIR}.staging`;
+  const stagingPy = path.join(stagingDir, 'bin', 'python3');
+  const installedMarker = path.join(stagingDir, '.deps-installed');
+  if (fs.existsSync(stagingPy) && depsMarkerMatches(installedMarker, reqHash)) {
+    try {
+      return await activateBackendEnv(stagingDir, reqHash);
+    } catch (error) {
+      await discardFailedBackendCandidate(stagingDir, error);
+      throw error;
+    }
+  }
+
   notify('正在初始化运行环境', '首次启动需要创建 Python 虚拟环境并安装依赖，约需 1-3 分钟。');
   const sysPy = findAvailableSystemPython();
-  const stagingDir = `${VENV_DIR}.staging-${process.pid}-${Date.now()}`;
-  const stagingPy = path.join(stagingDir, 'bin', 'python3');
-  const stagingMarker = path.join(stagingDir, '.deps-ok');
   await fsp.rm(stagingDir, { recursive: true, force: true });
   logLine('creating venv ...');
   try {
@@ -282,20 +363,10 @@ async function ensureBackendEnv(notify) {
     const r = spawnSync(pip, ['install', '--disable-pip-version-check', '-r', req],
       { stdio: 'inherit', env: { ...process.env, PIP_INDEX_URL: process.env.PIP_INDEX_URL || 'https://pypi.tuna.tsinghua.edu.cn/simple' } });
     if (r.status !== 0) throw new Error('后端依赖安装失败，详见 ' + LOG_FILE);
-    if (!isBackendEnvHealthy(stagingPy)) {
-      const probeLog = spawnSync(stagingPy, ['-c', 'import pydantic_core'], { encoding: 'utf8' });
-      const hint = looksLikeKysecDenial(probeLog.stderr) ? ' ' + kysecRemedyHint() : '';
-      throw new Error('后端依赖安装后运行时预检失败，详见 ' + LOG_FILE + hint);
-    }
-    await fsp.writeFile(stagingMarker, reqHash);
-    await swapBackendEnv(VENV_DIR, stagingDir, logLine);
-    return path.join(VENV_DIR, 'bin', 'python3');
+    await fsp.writeFile(installedMarker, reqHash);
+    return await activateBackendEnv(stagingDir, reqHash);
   } catch (error) {
-    try {
-      await fsp.rm(stagingDir, { recursive: true, force: true });
-    } catch (cleanupError) {
-      logLine(`staging 后端环境清理失败：${cleanupError.message}`);
-    }
+    await discardFailedBackendCandidate(stagingDir, error);
     throw error;
   }
 }
@@ -307,6 +378,11 @@ function startBackend(python, host = '127.0.0.1') {
       ...process.env,
       WANWEI_HOST: host,
       WANWEI_PORT: String(backendPort),
+      // Host checks are fail-closed in the backend. LAN mode accepts only the
+      // actual selected LAN IPv4 plus loopback; local mode accepts loopback.
+      WANWEI_ALLOWED_HOSTS: host === '0.0.0.0'
+        ? ['127.0.0.1', 'localhost', '::1', ...lanIPv4s()].filter(Boolean).join(',')
+        : '127.0.0.1,localhost,::1',
       WANWEI_API_KEY: apiKey,
       WANWEI_ENCRYPTION_KEY: process.env.WANWEI_ENCRYPTION_KEY || '',
       WANWEI_MEMORY_DB: path.join(RUNTIME_DIR, 'memory.db'),
@@ -354,6 +430,59 @@ function startBackend(python, host = '127.0.0.1') {
   });
 }
 
+/** Cold boot only: revoke stale LAN sessions before exposing the console. */
+function reconcileLanState() {
+  return new Promise((resolve, reject) => {
+    let req;
+    let settled = false;
+    const fail = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // Never include credentials, response bodies or transport errors in logs.
+      reject(new Error('Cold-start LAN reconciliation failed'));
+      try { if (req) req.abort(); } catch { /* already closed */ }
+    };
+    const timer = setTimeout(fail, 5000);
+    try {
+      req = net.request({
+        method: 'POST',
+        url: `http://127.0.0.1:${backendPort}/platform/system/lan/disable`,
+        redirect: 'error',
+      });
+      req.on('error', fail);
+      req.on('abort', fail);
+      req.setHeader('X-API-Key', apiKey);
+      req.on('response', (res) => {
+        const chunks = [];
+        let bytes = 0;
+        res.on('error', fail);
+        res.on('aborted', fail);
+        res.on('data', (chunk) => {
+          if (settled) return;
+          bytes += chunk.length;
+          if (bytes > 8192) { fail(); return; }
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          if (settled) return;
+          try {
+            const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            if (!data || data.enabled !== false || data.bind !== '127.0.0.1'
+                || data.token_set !== false || !Number.isInteger(data.revoked_sessions)
+                || data.revoked_sessions < 0) { fail(); return; }
+          } catch { fail(); return; }
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+        });
+        if (res.statusCode !== 200) fail();
+      });
+      req.end();
+    } catch { fail(); }
+  });
+}
+
 /** 停止后端；返回 Promise，等进程真正退出（5s 不退则 SIGKILL），供 LAN 重启与退出流程复用 */
 function stopBackend() {
   const proc = backendProc;
@@ -383,13 +512,20 @@ async function restartBackend(host) {
 }
 
 /** 取本机局域网 IPv4（优先私有网段 10./192.168./172.16-31.） */
-function firstLanIPv4() {
+function lanIPv4s() {
   const candidates = [];
   for (const list of Object.values(os.networkInterfaces())) {
     for (const it of list || []) {
-      if (it && it.family === 'IPv4' && !it.internal) candidates.push(it.address);
+      if (it && it.family === 'IPv4' && !it.internal && !candidates.includes(it.address)) {
+        candidates.push(it.address);
+      }
     }
   }
+  return candidates;
+}
+
+function firstLanIPv4() {
+  const candidates = lanIPv4s();
   const priv = candidates.find((a) => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(a));
   return priv || candidates[0] || '';
 }
@@ -856,8 +992,10 @@ if (!gotLock) {
       const py = await ensureBackendEnv((t, b) => notify(t, b));
       backendPython = py;
       await startBackend(py);
+      await reconcileLanState();
     } catch (err) {
       logLine('boot failed: ' + err.message);
+      await stopBackend();
       dialog.showErrorBox(APP_NAME + ' 启动失败', err.message);
       app.exit(1);
       return;
@@ -896,6 +1034,9 @@ if (process.env.WANWEI_DESKTOP_TEST_EXPORTS === '1') {
     decodeFileBuffer,
     depsMarkerMatches,
     isBackendEnvHealthy,
+    probeBackendEnv,
+    backendExecutionRemedyHint,
+    ensureBackendEnv,
     isFloatingWorkspaceVisible,
     setFloatingWorkspace,
   };

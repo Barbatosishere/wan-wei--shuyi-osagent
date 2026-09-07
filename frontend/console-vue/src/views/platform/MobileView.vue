@@ -12,9 +12,9 @@
  *   GET  /agents/context-size                           上下文体量（弹层）
  * 所有响应均做可选链容错；接口不可达时运行列表回退为「离线示例数据」。
  */
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { apiGet, apiPost, apiPut, isAuthError, isNetworkError } from '@/api/platform'
+import { apiGet, apiPost, apiPut, isAuthError, isNetworkError, type ReqOptions } from '@/api/platform'
 import { runStatusGroup, runStatusLabel } from '@/utils/platformEnums'
 import GfCard from '@/components/gf/GfCard.vue'
 import GfTag from '@/components/gf/GfTag.vue'
@@ -56,8 +56,9 @@ interface CtxInfo {
 }
 
 /* ── 配对态 ── */
-const TOKEN_KEY = 'wanwei-mobile-token'
-const PAIRED_KEY = 'wanwei-mobile-paired'
+// The LAN session credential is kept in memory only. Browser storage
+// (sessionStorage/localStorage) is off-limits for secrets, so a page reload
+// always requires a fresh pairing link from the desktop.
 const route = useRoute()
 const router = useRouter()
 const phase = ref<Phase>('verifying')
@@ -65,6 +66,36 @@ const failReason = ref('')
 const deviceName = ref('')
 const verifying = ref(false)
 const manualToken = ref('')
+let mounted = false
+let requestController = new AbortController()
+let localCredential = ''
+const requestOptions = (): ReqOptions => ({ signal: requestController.signal, credential: localCredential })
+const pairingRequestOptions = (): ReqOptions => ({ signal: requestController.signal, credential: '' })
+function isActiveRequest(controller: AbortController): boolean {
+  return mounted && controller === requestController && !controller.signal.aborted
+}
+function assertActiveRequest(controller: AbortController): void {
+  if (!isActiveRequest(controller)) throw new DOMException('Mobile session ended', 'AbortError')
+}
+
+// Body parsing can settle after abort. Keep both success and error responses
+// from a former session from changing a newly paired session's state.
+async function mobileRequest<T>(send: (options: ReqOptions) => Promise<T>): Promise<T> {
+  const controller = requestController
+  assertActiveRequest(controller)
+  if (phase.value !== 'paired' || !localCredential) throw new DOMException('Mobile session ended', 'AbortError')
+  try {
+    const result = await send(requestOptions())
+    assertActiveRequest(controller)
+    return result
+  } catch (error) {
+    assertActiveRequest(controller)
+    throw error
+  }
+}
+function mobileGet<T>(path: string): Promise<T> { return mobileRequest(options => apiGet<T>(path, options)) }
+function mobilePost<T>(path: string, body?: unknown): Promise<T> { return mobileRequest(options => apiPost<T>(path, body, options)) }
+function mobilePut<T>(path: string, body?: unknown): Promise<T> { return mobileRequest(options => apiPut<T>(path, body, options)) }
 
 /** 浮动小窗模式：桌面端浮动工作区以 /console/#/mobile?floating=1 加载（08-#37）。
  *  现状：桌面 main.js 加载该 URL 时未附带 token，小窗首启必落在配对门禁；
@@ -102,6 +133,7 @@ const ctxError = ref('')
 const toast = ref('')
 let toastTimer: ReturnType<typeof setTimeout> | undefined
 function showToast(text: string) {
+  if (!mounted) return
   toast.value = text
   if (toastTimer) clearTimeout(toastTimer)
   toastTimer = setTimeout(() => { toast.value = '' }, 3200)
@@ -141,28 +173,94 @@ function stripTokenFromUrl(): void {
   void router.replace({ query: rest })
 }
 
-async function verify(candidate: string, fromCache: boolean) {
+let sessionExpiryTimer: ReturnType<typeof setTimeout> | undefined
+function clearLanSession(reason = ''): void {
+  requestController.abort()
+  requestController = new AbortController()
+  localCredential = ''
+  if (sessionExpiryTimer) {
+    clearTimeout(sessionExpiryTimer)
+    sessionExpiryTimer = undefined
+  }
+  stopPolling()
+  runs.value = []
+  runsOffline.value = false
+  runsLoading.value = false
+  deciding.value = ''
+  messages.value = []
+  draft.value = ''
+  sending.value = false
+  archiving.value = false
+  powerBusy.value = false
+  ctxOpen.value = false
+  ctxLoading.value = false
+  ctxInfo.value = null
+  ctxError.value = ''
+  powerKnown.value = false
+  preventSleep.value = false
+  deviceName.value = ''
+  manualToken.value = ''
+  toast.value = ''
+  if (toastTimer !== undefined) {
+    clearTimeout(toastTimer)
+    toastTimer = undefined
+  }
+  verifying.value = false
+  phase.value = 'failed'
+  if (reason) failReason.value = reason
+}
+
+function armSessionExpiry(expiresAt: string): boolean {
+  if (!mounted) return false
+  const expiresMs = Date.parse(expiresAt)
+  if (!Number.isFinite(expiresMs) || expiresMs <= Date.now()) {
+    clearLanSession('会话凭证已过期，请从桌面端重新获取配对链接。')
+    return false
+  }
+  if (sessionExpiryTimer) clearTimeout(sessionExpiryTimer)
+  sessionExpiryTimer = setTimeout(() => {
+    if (mounted) clearLanSession('会话凭证已过期，请从桌面端重新获取配对链接。')
+  }, Math.min(expiresMs - Date.now(), 2_147_483_647))
+  return true
+}
+
+function handleSessionAuthError(e: unknown): boolean {
+  if (!mounted) return true
+  if (e instanceof DOMException && e.name === 'AbortError') return true
+  if (!isAuthError(e)) return false
+  clearLanSession('局域网会话已失效或被关闭，请从桌面端重新配对。')
+  return true
+}
+
+async function verify(candidate: string) {
   if (verifying.value || phase.value === 'paired') return
+  const controller = requestController
   verifying.value = true
   phase.value = 'verifying'
   failReason.value = ''
   try {
-    const res = await apiPost<unknown>('/system/lan/verify', { token: candidate })
+    const res = await apiPost<unknown>('/system/lan/verify', { token: candidate }, pairingRequestOptions())
+    if (!isActiveRequest(controller)) return
     const r = asRecord(res)
     const rejected = r !== null && (r.ok === false || r.paired === false || r.verified === false || r.success === false)
     if (rejected) throw new Error(pickStr(r, ['message', 'detail', 'error']) || '令牌未通过校验')
     deviceName.value = r ? pickStr(r, ['device_name', 'device', 'name']) : ''
-    localStorage.setItem(TOKEN_KEY, candidate)
-    localStorage.setItem(PAIRED_KEY, '1')
+    const sessionCredential = r ? pickStr(r, ['session_credential']) : ''
+    const expiresAt = r ? pickStr(r, ['expires_at']) : ''
+    if (!sessionCredential || !expiresAt) throw new Error('后端未返回有效的局域网会话凭证')
+    if (!isActiveRequest(controller)) return
+    localCredential = sessionCredential
+    if (!armSessionExpiry(expiresAt)) return
     phase.value = 'paired'
-    if (!fromCache) stripTokenFromUrl()
+    stripTokenFromUrl()
     startMain()
   } catch (e) {
-    if (fromCache) localStorage.removeItem(TOKEN_KEY)
+    if (!isActiveRequest(controller)) return
+    localCredential = ''
     phase.value = 'failed'
     failReason.value = maskToken(platformErrText(e), candidate)
   } finally {
-    verifying.value = false
+    if (isActiveRequest(controller)) verifying.value = false
   }
 }
 
@@ -170,28 +268,26 @@ function submitManualToken() {
   const candidate = manualToken.value.trim()
   if (!candidate || verifying.value) return
   manualToken.value = ''
-  void verify(candidate, false)
+  void verify(candidate)
+}
+
+function pairingTokenFromRoute(): string {
+  const raw = route.query.token
+  const fromQuery = Array.isArray(raw) ? raw[0] : raw
+  return typeof fromQuery === 'string' ? fromQuery.trim() : ''
 }
 
 function retryPair() {
-  const raw = route.query.token
-  const fromQuery = Array.isArray(raw) ? raw[0] : raw
-  const queryToken = typeof fromQuery === 'string' ? fromQuery.trim() : ''
-  const cached = localStorage.getItem(TOKEN_KEY) ?? ''
-  const candidate = queryToken || cached
+  const candidate = pairingTokenFromRoute()
   if (!candidate) {
     failReason.value = '链接中未携带配对令牌（token），请从桌面端重新获取配对链接或二维码。'
     return
   }
-  void verify(candidate, !queryToken)
+  void verify(candidate)
 }
 
 function unpair() {
-  localStorage.removeItem(TOKEN_KEY)
-  localStorage.removeItem(PAIRED_KEY)
-  stopPolling()
-  phase.value = 'failed'
-  failReason.value = '已解除本机配对。请从桌面端重新获取配对链接。'
+  clearLanSession('已解除本机配对。请从桌面端重新获取配对链接。')
 }
 
 /* ── 任务监视 ── */
@@ -230,16 +326,22 @@ function normalizeRuns(payload: unknown): RunItem[] {
 }
 
 async function loadRuns() {
+  const controller = requestController
   try {
-    const res = await apiGet<unknown>('/agents/runs')
+    const res = await mobileGet<unknown>('/agents/runs')
+    if (!isActiveRequest(controller)) return
     runs.value = normalizeRuns(res)
     runsOffline.value = false
   } catch (e) {
+    if (!isActiveRequest(controller)) return
+    if (handleSessionAuthError(e)) return
     const network = isNetworkError(e)
     runs.value = network ? SAMPLE_RUNS : []
     runsOffline.value = network
   } finally {
-    runsLoading.value = false
+    // A cancelled operation may settle after a new pairing has started its
+    // own work. Only that operation's session may release the loading state.
+    if (isActiveRequest(controller)) runsLoading.value = false
   }
 }
 
@@ -249,9 +351,11 @@ async function decide(run: RunItem, approved: boolean) {
     showToast('示例数据不可操作，待后端接入后再试。')
     return
   }
+  const controller = requestController
   deciding.value = run.id
   try {
-    const result = await apiPost<{ status?: string }>(`/agents/runs/${run.id}/approve`, { approved })
+    const result = await mobilePost<{ status?: string }>(`/agents/runs/${run.id}/approve`, { approved })
+    if (!isActiveRequest(controller)) return
     const actual = result.status
     if (actual === 'rejected') {
       showToast(`已拒绝「${run.title}」`)
@@ -262,9 +366,10 @@ async function decide(run: RunItem, approved: boolean) {
     }
     await loadRuns()
   } catch (e) {
-    showToast(`操作失败：${platformErrText(e)}`)
+    if (!isActiveRequest(controller)) return
+    if (!handleSessionAuthError(e)) showToast(`操作失败：${platformErrText(e)}`)
   } finally {
-    deciding.value = ''
+    if (isActiveRequest(controller)) deciding.value = ''
   }
 }
 
@@ -293,35 +398,41 @@ function extractReply(payload: unknown): string {
 async function sendChat() {
   const text = draft.value.trim()
   if (!text || sending.value) return
+  const controller = requestController
   sending.value = true
   draft.value = ''
   pushMsg('me', text)
   try {
-    const res = await apiPost<unknown>('/agents/chat', { message: text })
+    const res = await mobilePost<unknown>('/agents/chat', { message: text })
+    if (!isActiveRequest(controller)) return
     const reply = extractReply(res)
     pushMsg('agent', reply || '口信已送达，智能体思索中，进展见上方任务列表。')
   } catch (e) {
-    pushMsg('sys', `发送失败：${platformErrText(e)}`)
+    if (!isActiveRequest(controller)) return
+    if (!handleSessionAuthError(e)) pushMsg('sys', `发送失败：${platformErrText(e)}`)
   } finally {
-    sending.value = false
+    if (isActiveRequest(controller)) sending.value = false
   }
 }
 
 /* ── 快捷操作 ── */
 async function archiveDreams() {
   if (archiving.value) return
+  const controller = requestController
   archiving.value = true
   try {
-    const res = await apiPost<unknown>('/memory/dreams/archive-now')
+    const res = await mobilePost<unknown>('/memory/dreams/archive-now')
+    if (!isActiveRequest(controller)) return
     const r = asRecord(res)
     const n = r ? pickNum(r, ['archived', 'archived_count', 'count', 'total']) : NaN
     const simulated = r !== null && (r.simulated === true || r.stub === true)
     const base = Number.isFinite(n) ? `已归档 ${n} 段梦境` : '梦境整理请求已送达'
     showToast(simulated ? `${base}（模拟）` : base)
   } catch (e) {
-    showToast(`整理失败：${platformErrText(e)}`)
+    if (!isActiveRequest(controller)) return
+    if (!handleSessionAuthError(e)) showToast(`整理失败：${platformErrText(e)}`)
   } finally {
-    archiving.value = false
+    if (isActiveRequest(controller)) archiving.value = false
   }
 }
 
@@ -335,8 +446,10 @@ function normalizePower(payload: unknown): boolean | null {
   return null
 }
 async function loadPower() {
+  const controller = requestController
   try {
-    const res = await apiGet<unknown>('/system/power')
+    const res = await mobileGet<unknown>('/system/power')
+    if (!isActiveRequest(controller)) return
     const v = normalizePower(res)
     if (v === null) {
       powerKnown.value = false
@@ -344,25 +457,32 @@ async function loadPower() {
       preventSleep.value = v
       powerKnown.value = true
     }
-  } catch {
+  } catch (e) {
+    if (!isActiveRequest(controller)) return
+    if (handleSessionAuthError(e)) return
     powerKnown.value = false
   }
 }
 async function togglePower() {
   if (powerBusy.value) return
+  const controller = requestController
   powerBusy.value = true
   const next = powerKnown.value ? !preventSleep.value : true
   try {
-    const res = await apiPut<unknown>('/system/power', { prevent_sleep: next, gear: 'device' })
+    const res = await mobilePut<unknown>('/system/power', { prevent_sleep: next, gear: 'device' })
+    if (!isActiveRequest(controller)) return
     const v = normalizePower(res)
     preventSleep.value = v ?? next
     powerKnown.value = true
     showToast(preventSleep.value ? '防睡眠已开启，设备将保持清醒' : '防睡眠已关闭')
   } catch (e) {
-    showToast(`切换失败：${platformErrText(e)}`)
-    await loadPower()
+    if (!isActiveRequest(controller)) return
+    if (!handleSessionAuthError(e)) {
+      showToast(`切换失败：${platformErrText(e)}`)
+      await loadPower()
+    }
   } finally {
-    powerBusy.value = false
+    if (isActiveRequest(controller)) powerBusy.value = false
   }
 }
 
@@ -387,18 +507,21 @@ function normalizeCtx(payload: unknown): CtxInfo | null {
   }
 }
 async function openContext() {
+  const controller = requestController
   ctxOpen.value = true
   ctxLoading.value = true
   ctxInfo.value = null
   ctxError.value = ''
   try {
-    const res = await apiGet<unknown>('/agents/context-size')
+    const res = await mobileGet<unknown>('/agents/context-size')
+    if (!isActiveRequest(controller)) return
     ctxInfo.value = normalizeCtx(res)
     if (!ctxInfo.value) ctxError.value = '后端已响应，但未返回可识别的上下文体量字段。'
   } catch (e) {
-    ctxError.value = platformErrText(e)
+    if (!isActiveRequest(controller)) return
+    if (!handleSessionAuthError(e)) ctxError.value = platformErrText(e)
   } finally {
-    ctxLoading.value = false
+    if (isActiveRequest(controller)) ctxLoading.value = false
   }
 }
 function fmtNum(n: number): string {
@@ -415,6 +538,7 @@ function stopPolling() {
 }
 function startMain() {
   stopPolling()
+  runsLoading.value = true
   void loadRuns()
   void loadPower()
   pollTimer = setInterval(() => { void loadRuns() }, 5000)
@@ -423,29 +547,42 @@ function startMain() {
   }
 }
 
+// Fragment-only navigation reuses this component. Cancel the previous session
+// when a fresh pairing link arrives, just as for an explicit local unpair.
+watch(pairingTokenFromRoute, candidate => {
+  if (!mounted || !candidate) return
+  clearLanSession()
+  void verify(candidate)
+})
+
 onMounted(() => {
-  // 已配对状态作为终态：避免一次性 token 被重复 verify 触发「已使用」
-  if (localStorage.getItem(PAIRED_KEY) === '1') {
-    phase.value = 'paired'
-    startMain()
+  mounted = true
+  const candidate = pairingTokenFromRoute()
+  // An explicit pairing link takes priority over any previous session.
+  if (candidate) {
+    clearLanSession()
+    void verify(candidate)
     return
   }
-  const raw = route.query.token
-  const fromQuery = Array.isArray(raw) ? raw[0] : raw
-  const queryToken = typeof fromQuery === 'string' ? fromQuery.trim() : ''
-  const cached = (localStorage.getItem(TOKEN_KEY) ?? '').trim()
-  const candidate = queryToken || cached
-  if (!candidate) {
-    phase.value = 'failed'
-    failReason.value = '链接中未携带配对令牌（token），请从桌面端重新获取配对链接或二维码。'
-    return
-  }
-  void verify(candidate, !queryToken)
+  // No credential survives a reload (in-memory only), so without a pairing
+  // token there is nothing to resume.
+  clearLanSession()
+  failReason.value = '链接中未携带配对令牌（token），请从桌面端重新获取配对链接或二维码。'
 })
 
 onBeforeUnmount(() => {
+  mounted = false
+  requestController.abort()
+  localCredential = ''
   stopPolling()
-  if (toastTimer) clearTimeout(toastTimer)
+  if (sessionExpiryTimer !== undefined) {
+    clearTimeout(sessionExpiryTimer)
+    sessionExpiryTimer = undefined
+  }
+  if (toastTimer !== undefined) {
+    clearTimeout(toastTimer)
+    toastTimer = undefined
+  }
 })
 </script>
 

@@ -1,7 +1,7 @@
 """Cross-API-key isolation tests for provider cockpit configuration.
 
-从 upstream-jianghe 移植，适配 main 约定：双 key 鉴权经
-``backend.app.security.auth._verify_api_key`` monkeypatch 实现。
+The second key is explicitly provisioned in the test identity registry;
+requests exercise the production authentication middleware.
 """
 from __future__ import annotations
 
@@ -20,24 +20,21 @@ HEADERS_B = {"x-api-key": KEY_B}
 
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, seed_identity):
     monkeypatch.setenv("WANWEI_API_KEY", KEY_A)
     monkeypatch.setenv("WANWEI_MEMORY_DB", str(tmp_path / "memory.db"))
     monkeypatch.setenv("WANWEI_PLATFORM_DIR", str(tmp_path / "platform"))
     monkeypatch.delenv("WANWEI_PRODUCTION", raising=False)
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-    import backend.app.security.auth as auth
     import backend.app.init_db
     import backend.app.app_runtime as runtime_mod
     import backend.app.main as main_mod
 
-    verify = lambda provided: provided in {KEY_A, KEY_B}  # noqa: E731
-    monkeypatch.setattr(auth, "_verify_api_key", verify)
-
     importlib.reload(runtime_mod)
     importlib.reload(main_mod)
     backend.app.init_db.main()
+    seed_identity(KEY_B)
     with TestClient(main_mod.app, raise_server_exceptions=False) as test_client:
         yield test_client
 
@@ -126,3 +123,72 @@ def test_ownerless_legacy_provider_rows_bind_to_compatible_actor(client):
     openai_b = next(item for item in foreign.json() if item["pid"] == "openai")
     assert openai_b["configured"] is False
     assert client.get("/platform/providers/aux", headers=HEADERS_B).json()["model"] == ""
+
+
+def test_same_provider_can_have_legacy_and_scoped_records(client):
+    from backend.app.platform_api import providers as providers_mod
+
+    providers_mod._store.set(
+        "openai",
+        {"enabled": True, "model": "legacy", "api_key_encrypted": ""},
+    )
+    configured = client.put(
+        "/platform/providers/configs/openai",
+        json={"model": "owner-b", "enabled": True},
+        headers=HEADERS_B,
+    )
+    assert configured.status_code == 200
+    assert configured.json()["model"] == "owner-b"
+
+    listed_a = client.get("/platform/providers/configs", headers=HEADERS_A)
+    listed_b = client.get("/platform/providers/configs", headers=HEADERS_B)
+    assert next(item for item in listed_a.json() if item["pid"] == "openai")["model"] == "legacy"
+    assert next(item for item in listed_b.json() if item["pid"] == "openai")["model"] == "owner-b"
+    raw = providers_mod._store.all()
+    assert raw["openai"]["model"] == "legacy"
+    assert any(
+        isinstance(value, dict)
+        and value.get("openai", {}).get("model") == "owner-b"
+        for key, value in raw.items()
+        if key.startswith(providers_mod._OWNER_KEY_PREFIX)
+    )
+
+
+def test_deleting_updated_legacy_provider_does_not_restore_old_credentials(client):
+    from backend.app.platform_api import providers as providers_mod
+    from backend.app.security import encryption
+
+    providers_mod._store.set(
+        "openai",
+        {
+            "enabled": True,
+            "model": "legacy-model",
+            "api_key_encrypted": encryption.encrypt("test-legacy-provider-key"),
+        },
+    )
+    # Another owner can keep a separate configuration during legacy migration.
+    created_b = client.put(
+        "/platform/providers/configs/openai",
+        json={"model": "owner-b-model", "enabled": True},
+        headers=HEADERS_B,
+    )
+    assert created_b.status_code == 200, created_b.text
+    updated_a = client.put(
+        "/platform/providers/configs/openai",
+        json={"model": "updated-model"},
+        headers=HEADERS_A,
+    )
+    assert updated_a.status_code == 200, updated_a.text
+
+    deleted = client.delete("/platform/providers/configs/openai", headers=HEADERS_A)
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["removed"] is True
+    listed_a = client.get("/platform/providers/configs", headers=HEADERS_A)
+    openai_a = next(item for item in listed_a.json() if item["pid"] == "openai")
+    assert openai_a["configured"] is False
+    assert openai_a["has_api_key"] is False
+    listed_b = client.get("/platform/providers/configs", headers=HEADERS_B)
+    openai_b = next(item for item in listed_b.json() if item["pid"] == "openai")
+    assert openai_b["configured"] is True
+    assert openai_b["model"] == "owner-b-model"
+    assert "openai" not in providers_mod._store.all()

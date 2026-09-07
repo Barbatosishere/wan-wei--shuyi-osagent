@@ -119,7 +119,7 @@ python scripts/demo_governance.py --api-key <key>
 
 ### 路径 B：本地跑起来
 
-前置条件：Python 3.10+；Node.js 22.12+（仅 Electron 源码构建需要，终端用户安装 deb/rpm 包不需要）。
+前置条件：Python 3.10+；前端与 Electron 源码构建需要 Node.js 22.12+、npm 10+，终端用户安装 deb/rpm 包不需要 Node.js。
 
 ```bash
 # Windows
@@ -135,7 +135,7 @@ bash scripts/run_dev.sh
 
 启动后三步走：
 
-1. **发第一段对话**：进入「万枢工作台」直接提问。未配置模型时走 `local_mock` 通路——零配置也能跑通全流程。
+1. **发第一段对话**：进入「万枢工作台」提问。未配置可用模型时会返回配置或供应商错误，完成下一步接入后再发起真实对话。
 2. **接入模型**：进入「模型接入」视图，从 31 家供应商目录中任选一家，填入 API key。OpenAI 兼容云端供应商（含 DeepSeek）与 AWS Bedrock 已接通真实调用；其余在 alpha 阶段标注为 stub。
 3. **说「记住」**：记忆指令写入前经 Policy Gate 校验敏感内容（拦截密码 / 密钥 / 投毒），写入后可在「记忆中枢」查看与编辑。
 
@@ -220,6 +220,7 @@ bash scripts/run_dev.sh
 - Origin / Host 校验阻断 CSRF 与 DNS-rebinding。
 - SSRF 防护与代理共存，pinned-IP 白名单控制出向连接。
 - 自动化工作流按执行档位分级：human_review（默认）/ sandbox / device。
+- 资源与后台工作流审计按稳定身份隔离；源码版手机配对使用一次性 token 与独立短期凭证。身份 API、会话失效及升级回滚约束见 [身份隔离与 LAN 说明](docs/OWNER_ISOLATION_AND_LAN.md)。
 
 **治理层端点一览**（跨属主请求按「不存在」处理返回 404，不泄漏记忆存在性）：
 
