@@ -1,5 +1,7 @@
 # 路线图与边界
 
-已完成能力包括 MemoryOS 治理层、EGPM Phase-1/2/3、Preference Graph 偏好演化图（PR #200）、知识冲突消解与演化（PR #203）、TKE 双时态与演化时间轴（PR #205，Benchmark 双 100%）、三路 RRF 融合代码与麒麟原生验证。下一阶段来自 CHANGELOG 的工作包括真实漂移接线、Outcome Validation 与 Preference Graph 消融纳入统一基准、知识演化/偏好重排接入生产检索路径、外部向量后端、git worktree 绑定、梦境夜间调度及更深的麒麟系统集成。
+已完成能力包括 MemoryOS 治理层、EGPM Phase-1/2/3、Preference Graph 偏好演化图（PR #200）、知识冲突消解与演化（PR #203）、TKE 双时态与演化时间轴（PR #205，Benchmark 双 100%）、三路 RRF 融合**代码与消融验证**（PR #197，尚未接入生产检索路径）、麒麟原生 SDK 常驻 bridge（随 v1.0.0 发布，PR #212）与 V11 全指标实测证据包（PR #221）、v1.0.0 发布链（staging 打包 + RPM/DEB 双包，PR #212）、身份注册门槛与数据库身份指纹（PR #214）、owner 隔离与安全远程会话（PR #215）、全仓木兰 PSL v2 版权头与 CI 校验（PR #217/#218）。
 
-诚实边界：系统是单节点 alpha；成本为估算；无实跑指标写“未实跑”；MEB 1.0 仅代表本仓自建用例集；原生 SDK 不可用时回退 FTS5；未接通能力以 stub/simulated 标识。
+下一阶段来自 CHANGELOG 的工作包括真实漂移接线、Outcome Validation 与 Preference Graph 消融纳入统一基准、知识演化/偏好重排与 RRF 融合接入生产检索路径、语义回退通道 HNSW 索引化（当前 brute-force 余弦在万条以上退化，50k 档 p95 2785ms）、偏好提取 `MEB-PREF-003` 语义通道泄漏的三条优化方向与用例集扩容、外部向量后端、git worktree 绑定、梦境夜间调度及更深的麒麟系统集成。
+
+诚实边界：系统是单节点形态（v1.0.0，2026-09-05 发布），不宣称生产级高可用；成本为估算；无实跑指标写“未实跑”；MEB 1.0 仅代表本仓自建用例集；偏好提取按多口径如实报告（VM 当日公开集 4 例粒度 3/4，词面通道 4/4，历史 12 例宽口径 91.67%），未达口径已附优化方向；原生 SDK 不可用时回退 FTS5；未接通能力以 stub/simulated 标识。

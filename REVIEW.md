@@ -6,16 +6,19 @@ debt, speculative redesigns, or cosmetic preferences into blocking findings.
 
 ## Project Contract
 
-This repository is an alpha research prototype and competition delivery base for
-an OS Agent memory-governance platform. It contains a FastAPI application,
-SQLite/FTS5 persistence, a Vue 3 console, offline evaluation fixtures, and a
-hardened single-node container path. Preserve the distinction between implemented,
-partial, planned, simulated, and measured capabilities.
+This repository is a single-node release (v1.0.0, published 2026-09-05) and
+competition delivery base for an OS Agent memory-governance platform. It
+contains a FastAPI application, SQLite/FTS5 persistence, a Vue 3 console,
+offline evaluation fixtures, a hardened single-node container path, and an
+Electron Kylin desktop client shipped as deb/rpm. It does not claim
+production-grade high availability. Preserve the distinction between
+implemented, partial, planned, simulated, and measured capabilities.
 
 The numbered 20-cabin product model and its Chinese domain names are intentional.
 Do not recommend deleting or renaming them merely for stylistic uniformity.
 
-Version v0.11.0「万枢」adds a collaboration layer on top of that base: eight
+Version v0.11.0「万枢」(2026-07-18, now a historical version superseded by
+v1.0.0) added a collaboration layer on top of that base: eight
 backend modules under `backend/app/platform_api/` auto-discovered and mounted at
 `/platform` (`providers` with a 31-vendor model catalog, `agents`, `spaces`,
 `automation`, `knowledge`, `memory_center`, `system_svc`, `mcp_hub`), eleven
@@ -28,6 +31,20 @@ stub/simulated or disabled by default; do not flag those labels as missing
 features, but do flag any change that presents them as real, working behavior.
 The `device` gear is an executable gear alongside `sandbox`; dangerous system-wide
 operations are gated by explicit module-level checks rather than a global disable.
+
+Two further invariants landed after v0.11.0 and are blocking:
+
+- **Identity and owner isolation** (PR #214/#215): `actor_id_from_api_key`
+  auto-registers only the configured owner key; an unknown key derives a stable
+  scoped ID and must never be persisted as a credential. Cross-owner requests
+  return 404 ("does not exist"), not 403, so memory existence is not leaked.
+  LAN pairing uses one-time tokens plus a short-lived session credential and
+  must never hand out the desktop's primary API key.
+- **Database identity fingerprint** (PR #214): `prepare` records
+  `(st_dev, st_ino)` and `transaction()` re-checks it before writing, raising
+  `DatabaseIdentityError` instead of silently writing to an unlinked inode.
+  Readiness must use `verify_db_identity` with a fresh short-lived connection,
+  not a cached `SELECT 1`, which passes forever against a replaced file.
 
 ## Review Scope and Severity
 
@@ -156,8 +173,14 @@ operations are gated by explicit module-level checks rather than a global disabl
   lockfile changes, relevant builds/tests, and review of major-version behavior.
 - Do not bypass the public-release preflight. The owner has chosen the Mulan
   Permissive Software License v2 (木兰宽松许可证第2版, Mulan PSL v2) and committed
-  the root `LICENSE`; a release remains blocked until `VERSION_HISTORY[0].status`
-  is set to `released`. Review automation must not change the license choice.
+  the root `LICENSE`. `VERSION_HISTORY[0].status` is `released` for v1.0.0, so
+  the historical release gate is satisfied; the preflight still guards later
+  releases and must not be weakened. Review automation must not change the
+  license choice.
+- Every self-authored source file carries a Mulan PSL v2 copyright header
+  (`Copyright (c) 2026 QianChang-official`, PR #217/#218). CI enforces it with
+  `python scripts/license_header.py --check`; new files must include the header
+  or the gate fails. The tool is idempotent.
 
 ## Expected Validation
 
