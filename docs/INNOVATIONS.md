@@ -28,7 +28,7 @@
 - 问题：偏好推断可能误写、受情感噪声影响且缺少结果反馈。
 - 设计：Phase-1 提取、Phase-2 情感证据权重与 Outcome Validation、Phase-3 漂移代理检测；候选强制确认。
 - 实现位置：`backend/app/memory_runtime/policy_gate.py`、`preference_confidence.py`、`preference_outcome.py`、`preference_drift.py`、`sequence_mining.py`。
-- 效果/证据：`test_preference_confidence.py`、`test_preference_outcome.py`、`test_preference_drift.py`、`test_sequence_mining.py`；真实漂移与统一对照仍未验证。
+- 效果/证据：`test_preference_confidence.py`、`test_preference_outcome.py`、`test_preference_drift.py`、`test_sequence_mining.py`；算法级消融已补测——`scripts/bench_egpm.py` 于 2026-09-08 麒麟 V11 VM 实跑（72 事件 × 6 场景），preference_accuracy 0.6111、false_preference_rate 0.9474，+Drift 臂 drift_f1 0.4000（`reports/kylin-vm-evidence-20260908/03-egpm-report.md`）。该口径是**代理检测器的事件级准确率，不是系统偏好提取指标**，用于论证「朴素累计投票不可靠」，反衬置信度加权 + 确认门的设计必要性；Emotion / Persona / Safety Consistency 组件未实现，相应指标标记为未验证。Phase-2 真实漂移与统一对照实验仍未接入。
 
 ## 6. Preference Graph 偏好演化图（#198 / PR #200）
 - 问题：偏好以离散记忆存在，无法回答「偏好如何形成、是否演化、冲突时信谁」。
@@ -40,7 +40,7 @@
 - 问题：知识停留在「记录→检索」——新旧冲突无法显式表达、演化不可追踪、无版本治理；且无法回答「知识在什么时候为真」。
 - 设计：知识冲突检测四分类（fact/status/config/temporal，规则式带触发证据）；Knowledge Version 随 supersedes 递增；四因子 knowledge_confidence（recency/trust/source/usage）建议式裁决；Knowledge Explain；检索按版本状态降权。TKE 时序核心补全双时态（valid_time/transaction_time）、as-of 历史回放双模式（truth=世界真值，延迟导入场景；belief=系统当时认知，严格双时态）、时效冲突升级区间判定、Knowledge Timeline 聚合、freshness（verified_at + 引用稳定度 max 兜底）。
 - 实现位置：`backend/app/memory_runtime/knowledge_evolution.py`、`temporal_knowledge.py`。
-- 效果/证据：`test_knowledge_conflict.py`、`test_knowledge_evolution.py`、`test_active_knowledge.py`、`test_conflict_retrieval.py`、`test_temporal_knowledge.py`、`test_knowledge_timeline.py`、`test_freshness_scoring.py`（89 条）；TKE Benchmark 四场景（含延迟导入）**Active Knowledge Accuracy 100% / Evolution Chain Accuracy 100%**（`scripts/bench_tke.py`，`reports/tke_benchmark_report.md`）。
+- 效果/证据：`test_knowledge_conflict.py`、`test_knowledge_evolution.py`、`test_active_knowledge.py`、`test_conflict_retrieval.py`、`test_temporal_knowledge.py`、`test_knowledge_timeline.py`、`test_freshness_scoring.py`（96 条）；TKE Benchmark 四场景（含延迟导入）**Active Knowledge Accuracy 100% / Evolution Chain Accuracy 100%**（`scripts/bench_tke.py`，`reports/tke_benchmark_report.md`；2026-09-08 麒麟 V11 VM 当日复测同口径双 100%，`reports/kylin-vm-evidence-20260908/04-tke-benchmark.json`）。
 
 ## 与赛题创新点命名对照
 
@@ -53,6 +53,6 @@ issue 中点名的创新点与上述条目的对应关系：
 | Affective Memory | #5 EGPM Phase-1/2（情感证据权重） | `backend/app/memory_runtime/preference_confidence.py`，`test_affective_evidence.py`、`test_affective_retrieval.py`、`scripts/ablation_affective_weight.py` |
 | Trustworthy Forgetting | #1 可证明删除 + #2 生命周期状态机 + #6 级联遗忘 | 五处残留验证 + PDF 证书，10 态转移裁决，偏好级联遗忘（`test_preference_retrieval.py`） |
 | Preference Graph | #6（已交付，PR #200） | `backend/app/memory_runtime/preference_graph.py`，`test_preference_graph.py` 等 45 条 |
-| 知识冲突与演化 | #7（已交付，PR #203/#205） | `backend/app/memory_runtime/knowledge_evolution.py`、`temporal_knowledge.py`，89 条测试 + TKE Benchmark |
+| 知识冲突与演化 | #7（已交付，PR #203/#205） | `backend/app/memory_runtime/knowledge_evolution.py`、`temporal_knowledge.py`，96 条测试 + TKE Benchmark |
 
 Affective Memory 的三臂消融由 `scripts/ablation_affective_weight.py` 合成证据流完成，结果与局限按 CHANGELOG（#181）口径如实记录。
