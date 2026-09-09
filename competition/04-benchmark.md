@@ -1,6 +1,6 @@
 # 评测成绩单
 
-完整口径见 [docs/BENCHMARK.md](../docs/BENCHMARK.md)；**最新一轮实测为 2026-09-08 银河麒麟 V11 虚拟机内连续采集**，索引见 [09-麒麟 VM 全指标实测证据](09-vm-evidence.md)，原始文件在 [reports/kylin-vm-evidence-20260908/](../reports/kylin-vm-evidence-20260908/)（34 文件 + SHA256SUMS 完整性清单）。
+完整口径见 [docs/BENCHMARK.md](../docs/BENCHMARK.md)；**最新一轮实测为 2026-09-08 银河麒麟 V11 虚拟机内连续采集**，索引见 [09-麒麟 VM 全指标实测证据](09-vm-evidence.md)，原始文件在 [reports/kylin-vm-evidence-20260908/](../reports/kylin-vm-evidence-20260908/)（SHA256SUMS 覆盖 33 个入库文件）。
 
 ## 赛题四项硬指标（2026-09-08 麒麟 VM 实测）
 

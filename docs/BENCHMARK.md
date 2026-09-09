@@ -1,6 +1,6 @@
 # Benchmark
 
-> 现行最新一轮实测为 **2026-09-08 银河麒麟桌面操作系统 V11 虚拟机内连续采集**，四项赛题指标原始数据与逐条复现方法见 [competition/09-vm-evidence.md](../competition/09-vm-evidence.md)，原始文件在 [`reports/kylin-vm-evidence-20260908/`](../reports/kylin-vm-evidence-20260908/)（含 SHA256SUMS）。本文同时保留历史宿主机口径以便对照，两者均标注采集日期与环境。
+> 现行最新一轮实测为 **2026-09-08 银河麒麟桌面操作系统 V11 虚拟机内连续采集**，四项赛题指标原始数据与逐条复现方法见 [competition/09-vm-evidence.md](../competition/09-vm-evidence.md)，原始文件在 [`reports/kylin-vm-evidence-20260908/`](../reports/kylin-vm-evidence-20260908/)（SHA256SUMS 覆盖 33 个入库文件）。本文同时保留历史宿主机口径以便对照，两者均标注采集日期与环境。
 
 ## 偏好提取
 
