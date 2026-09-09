@@ -18,5 +18,6 @@
 6. [演示场景](06-demo-scenarios.md)
 7. [路线图与边界](07-roadmap.md)
 8. [效果演示视频分镜脚本](08-demo-video-script.md)
+9. [麒麟 VM 全指标实测证据](09-vm-evidence.md)——2026-09-08 银河麒麟 V11 虚拟机内当日连续采集的四项赛题指标原始数据与真实场景案例（证据包 [reports/kylin-vm-evidence-20260908/](../reports/kylin-vm-evidence-20260908/)）
 
 `docs/` 保存设计、实现与测试的技术原文（`INNOVATIONS.md`、`BENCHMARK.md`、`MemoryOS-记忆治理层.md` 等），与本目录互相链接但不重复替代。
