@@ -43,19 +43,22 @@ def current_audit_owner() -> str | None:
     return _AUDIT_OWNER.get()
 
 
-def _configured_owner() -> str | None:
+def _configured_owner(conn: sqlite3.Connection | None = None) -> str | None:
     try:
         from ..security.auth import actor_id_from_api_key, get_api_key
 
-        return actor_id_from_api_key(get_api_key())
+        return actor_id_from_api_key(get_api_key(), conn=conn)
     except Exception:
         return None
 
 
-def _effective_owner(owner_id: str | None) -> str | None:
+def _effective_owner(
+    owner_id: str | None,
+    conn: sqlite3.Connection | None = None,
+) -> str | None:
     if owner_id is not None:
         return owner_id
-    return current_audit_owner() or _configured_owner()
+    return current_audit_owner() or _configured_owner(conn)
 
 
 def _read_owner(owner_id: str | None) -> str | None:
@@ -64,9 +67,12 @@ def _read_owner(owner_id: str | None) -> str | None:
     return current_audit_owner() or _configured_owner()
 
 
-def _legacy_owner_allowed(owner_id: str | None) -> bool:
+def _legacy_owner_allowed(
+    owner_id: str | None,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
     """Expose ownerless historical rows only to the configured actor."""
-    return owner_id is not None and owner_id == _configured_owner()
+    return owner_id is not None and owner_id == _configured_owner(conn)
 
 
 def _ensure_audit_schema(conn) -> None:
@@ -100,6 +106,9 @@ def record_in_transaction(
     _ensure_audit_schema(conn)
     audit_id = "audit_" + secrets.token_hex(6)
     safe_payload = redact_audit_payload(payload)
+    # Resolve owner on the caller's connection. Nested get_conn() would close
+    # this handle if another thread bumped the connection generation.
+    resolved_owner_id = _effective_owner(owner_id, conn)
     conn.execute(
         "INSERT INTO audit_logs(audit_id,event_type,payload,created_at,owner_id) "
         "VALUES (?,?,?,?,?)",
@@ -108,7 +117,7 @@ def record_in_transaction(
             event_type,
             json.dumps(safe_payload, ensure_ascii=False),
             utc_now_iso(),
-            _effective_owner(owner_id),
+            resolved_owner_id,
         ),
     )
     return audit_id
@@ -116,6 +125,10 @@ def record_in_transaction(
 
 def record(event_type: str, payload: dict, *, owner_id: str | None = None) -> str:
     """Record an audit event with sensitive data redaction and owner scope."""
+    # Resolve owner before opening the thread-local connection. `_configured_owner()`
+    # may call `get_conn()`; if another thread bumped the connection generation in
+    # between, a nested get_conn() would close the handle this function still holds.
+    owner_id = _effective_owner(owner_id)
     conn = get_conn()
     _ensure_audit_table(conn)
     audit_id = record_in_transaction(conn, event_type, payload, owner_id=owner_id)
@@ -139,11 +152,14 @@ def list_logs(
     # also prevents an empty owner from selecting unclaimed legacy rows.
     if not read_owner:
         return []
+    # Resolve the configured-owner comparison before opening the list connection
+    # so a nested identity lookup cannot close the handle used below.
+    legacy_allowed = _legacy_owner_allowed(read_owner)
 
     conn = get_conn()
     _ensure_audit_table(conn)
     owner_clause = "owner_id=?"
-    if _legacy_owner_allowed(read_owner):
+    if legacy_allowed:
         owner_clause = "(owner_id=? OR owner_id IS NULL OR owner_id='')"
     query = "SELECT * FROM audit_logs WHERE " + owner_clause
     order_and_limit = " ORDER BY created_at DESC LIMIT ?"
